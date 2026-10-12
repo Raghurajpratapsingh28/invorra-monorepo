@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: Invorra API
+  version: 0.2.0
+  description: Multi-tenant inventory intelligence API. All tenant routes require the invorra_token cookie.
+paths:
+  /health:
+    get:
+      summary: Process liveness
+  /ready:
+    get:
+      summary: Database readiness
+  /api/auth/register:
+    post:
+      summary: Create an organization and owner
+  /api/auth/login:
+    post:
+      summary: Start a session
+  /api/auth/logout:
+    post:
+      summary: End a session
+  /api/auth/me:
+    get:
+      summary: Current user
+  /api/products:
+    get:
+      summary: List products
+    post:
+      summary: Create a product
+  /api/inventory:
+    get:
+      summary: List inventory positions
+    post:
+      summary: Create an inventory position
+  /api/inventory/risks:
+    get:
+      summary: Stockout risk for each position
+  /api/sales:
+    get:
+      summary: List sales
+    post:
+      summary: Record a sale and decrement inventory
+  /api/suppliers:
+    get:
+      summary: List suppliers
+    post:
+      summary: Create a supplier
+  /api/forecasts:
+    get:
+      summary: List stored forecasts
+  /api/forecasts/generate:
+    post:
+      summary: Generate deterministic forecasts
+  /api/replenishment:
+    get:
+      summary: List replenishment recommendations
+  /api/replenishment/generate:
+    post:
+      summary: Generate recommendations from forecast, safety stock, and MOQ
+  /api/replenishment/{id}/approve:
+    post:
+      summary: Approve a recommendation and create a purchase order
+  /api/replenishment/{id}/reject:
+    post:
+      summary: Reject a recommendation
+  /api/purchase-orders:
+    get:
+      summary: List purchase orders
+    post:
+      summary: Create a purchase order
+  /api/purchase-orders/{id}:
+    get:
+      summary: Purchase order detail and status timeline
+  /api/purchase-orders/{id}/status:
+    patch:
+      summary: Change purchase order status
+  /api/dashboard/summary:
+    get:
+      summary: Command center metrics
+      parameters:
+        - in: query
+          name: days
+          schema: { type: integer, default: 30 }
+  /api/dashboard/sales:
+    get:
+      summary: Sales time series
+  /api/dashboard/inventory-health:
+    get:
+      summary: Risk counts by warehouse
+  /api/dashboard/stockout-risks:
+    get:
+      summary: Highest stockout risks
+  /api/audit-logs:
+    get:
+      summary: Paginated audit log
+  /api/assistant/chat:
+    post:
+      summary: Ask the operations assistant
+      description: The assistant calls tenant-scoped tools. It does not approve orders until /api/assistant/confirm.
+  /api/assistant/confirm:
+    post:
+      summary: Confirm or cancel a pending assistant action
+  /api/assistant/explain:
+    post:
+      summary: Explain a recommendation or inventory position using stored figures

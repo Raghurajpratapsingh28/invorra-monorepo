@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: invorra
+          POSTGRES_PASSWORD: invorra
+          POSTGRES_DB: invorra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U invorra -d invorra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://invorra:invorra@localhost:5432/invorra?schema=public
+      JWT_SECRET: ci-only-invorra-jwt-secret-at-least-32-chars
+      PORT: 4000
+      NODE_ENV: test
+      CORS_ORIGIN: http://localhost:5173
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate --schema prisma/schema.prisma
+      - name: Migrate
+        run: npx prisma migrate deploy --schema prisma/schema.prisma
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck -w @invorra/api
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check forecast service
+        run: |
+          python -m pip install -r ml/requirements.txt
+          python -c "import sys; sys.path.insert(0, 'ml'); from app.main import app; print(app.title)"
