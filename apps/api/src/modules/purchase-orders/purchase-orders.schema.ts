@@ -1,4 +1,4 @@
-import { PurchaseOrderStatus } from '@prisma/client';
+import { PurchaseOrderStatus } from '../../domain/enums';
 import { z } from 'zod';
 import { idSchema, moneySchema, paginationFields, positiveIntSchema } from '../../utils/zod';
 

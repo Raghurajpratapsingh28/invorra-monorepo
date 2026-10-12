@@ -321,5 +321,7 @@ export function Field({ label, children }: { label: string; children: ReactNode 
   );
 }
 
-export const inputClass =
-  'w-full rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink shadow-sm outline-none transition placeholder:text-stone-400 focus:border-copper focus:ring-2 focus:ring-copper/15';
+export const controlClass =
+  'rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink shadow-sm outline-none transition placeholder:text-stone-400 focus:border-copper focus:ring-2 focus:ring-copper/15';
+
+export const inputClass = `w-full ${controlClass}`;

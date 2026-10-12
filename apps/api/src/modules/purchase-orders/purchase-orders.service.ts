@@ -1,10 +1,31 @@
-import { Prisma, PurchaseOrderStatus, UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { can } from '../../config/permissions';
+import {
+  cols,
+  countDocs,
+  findMany,
+  findOne,
+  insertOne,
+  mapByIds,
+  newId,
+  patchOne,
+  withTransaction,
+} from '../../db/mongo';
+import type {
+  AuditLogDoc,
+  InventoryDoc,
+  ProductDoc,
+  PurchaseOrderDoc,
+  PurchaseOrderItemDoc,
+  RecommendationDoc,
+  SupplierDoc,
+  UserDoc,
+  WarehouseDoc,
+} from '../../domain/documents';
+import { PurchaseOrderStatus, RecommendationStatus, type UserRole } from '../../domain/enums';
 import { publishEvent } from '../../events/publisher';
 import { DomainEventName } from '../../events/types';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
 import { conflict, forbidden, notFound } from '../../utils/errors';
 import { decimalToString, toDecimal } from '../../utils/money';
 import { toPagination, toSkip } from '../../utils/pagination';
@@ -31,20 +52,34 @@ const TRANSITIONS: Record<PurchaseOrderStatus, PurchaseOrderStatus[]> = {
   CANCELLED: [],
 };
 
-const detailInclude = {
-  items: true,
-  supplier: { select: { id: true, name: true, code: true } },
-  warehouse: { select: { id: true, name: true, code: true, city: true } },
-} satisfies Prisma.PurchaseOrderInclude;
+type OrderView = PurchaseOrderDoc & {
+  supplier?: Pick<SupplierDoc, 'id' | 'name' | 'code'>;
+  warehouse?: Pick<WarehouseDoc, 'id' | 'name' | 'code' | 'city'>;
+};
 
-type PurchaseOrderDetail = Prisma.PurchaseOrderGetPayload<{ include: typeof detailInclude }>;
+async function hydrate(rows: PurchaseOrderDoc[]): Promise<OrderView[]> {
+  const [suppliers, warehouses] = await Promise.all([
+    mapByIds<SupplierDoc>(cols.suppliers, rows.map((row) => row.supplierId)),
+    mapByIds<WarehouseDoc>(cols.warehouses, rows.map((row) => row.warehouseId)),
+  ]);
+  return rows.map((row) => {
+    const supplier = suppliers.get(row.supplierId);
+    const warehouse = warehouses.get(row.warehouseId);
+    return {
+      ...row,
+      ...(supplier ? { supplier: { id: supplier.id, name: supplier.name, code: supplier.code } } : {}),
+      ...(warehouse
+        ? { warehouse: { id: warehouse.id, name: warehouse.name, code: warehouse.code, city: warehouse.city } }
+        : {}),
+    };
+  });
+}
 
-export function toPurchaseOrder(order: PurchaseOrderDetail) {
+export function toPurchaseOrder(order: OrderView) {
   const total = order.items.reduce(
     (sum, item) => sum.plus(toDecimal(item.unitCost).mul(item.quantity)),
     toDecimal(0),
   );
-
   return {
     id: order.id,
     organizationId: order.organizationId,
@@ -76,95 +111,90 @@ export function toPurchaseOrder(order: PurchaseOrderDetail) {
 }
 
 async function loadOrder(organizationId: string, id: string) {
-  const order = await prisma.purchaseOrder.findFirst({
-    where: { id, organizationId },
-    include: detailInclude,
-  });
-  if (!order) {
-    throw notFound('Purchase order not found');
-  }
-  return order;
+  const order = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, { _id: id, organizationId });
+  if (!order) throw notFound('Purchase order not found');
+  const [view] = await hydrate([order]);
+  if (!view) throw notFound('Purchase order not found');
+  return view;
 }
 
 export async function listPurchaseOrders(organizationId: string, query: ListQuery) {
-  const where: Prisma.PurchaseOrderWhereInput = {
+  const filter = {
     organizationId,
     ...(query.status ? { status: query.status } : {}),
     ...(query.supplierId ? { supplierId: query.supplierId } : {}),
     ...(query.warehouseId ? { warehouseId: query.warehouseId } : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.purchaseOrder.count({ where }),
-    prisma.purchaseOrder.findMany({
-      where,
-      include: detailInclude,
-      orderBy: { createdAt: 'desc' },
+  const [total, rows] = await Promise.all([
+    countDocs(cols.purchaseOrders, filter),
+    findMany<PurchaseOrderDoc>(cols.purchaseOrders, filter, {
+      sort: { createdAt: -1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
-    }),
+      limit: query.limit,
+    }).then(hydrate),
   ]);
-
-  return {
-    items: rows.map(toPurchaseOrder),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map(toPurchaseOrder), pagination: toPagination(query.page, query.limit, total) };
 }
 
 export async function getPurchaseOrder(organizationId: string, id: string) {
   const order = await loadOrder(organizationId, id);
-  const audits = await prisma.auditLog.findMany({
-    where: { organizationId, entityType: 'PurchaseOrder', entityId: id },
-    orderBy: { createdAt: 'asc' },
-    include: { user: { select: { id: true, name: true, email: true } } },
-  });
+  const audits = await findMany<AuditLogDoc>(
+    cols.auditLogs,
+    { organizationId, entityType: 'PurchaseOrder', entityId: id },
+    { sort: { createdAt: 1 } },
+  );
+  const users = await mapByIds<UserDoc>(
+    cols.users,
+    audits.map((entry) => entry.userId).filter((userId): userId is string => Boolean(userId)),
+  );
   return {
     ...toPurchaseOrder(order),
-    timeline: audits.map((entry) => ({
-      id: entry.id,
-      action: entry.action,
-      at: entry.createdAt,
-      actor: entry.user,
-      metadata: entry.metadata,
-    })),
+    timeline: audits.map((entry) => {
+      const user = entry.userId ? users.get(entry.userId) : undefined;
+      return {
+        id: entry.id,
+        action: entry.action,
+        at: entry.createdAt,
+        actor: user ? { id: user.id, name: user.name, email: user.email } : null,
+        metadata: entry.metadata,
+      };
+    }),
   };
 }
 
-export async function createPurchaseOrder(
-  organizationId: string,
-  userId: string,
-  input: CreateBody,
-) {
-  const [supplier, warehouse, products] = await Promise.all([
-    prisma.supplier.findFirst({ where: { id: input.supplierId, organizationId } }),
-    prisma.warehouse.findFirst({ where: { id: input.warehouseId, organizationId } }),
-    prisma.product.findMany({
-      where: { organizationId, id: { in: input.items.map((item) => item.productId) } },
-    }),
-  ]);
+function lineItems(organizationId: string, input: CreateBody, productById: Map<string, ProductDoc>): PurchaseOrderItemDoc[] {
+  return input.items.map((item) => {
+    const product = productById.get(item.productId);
+    return {
+      id: newId(),
+      organizationId,
+      productId: item.productId,
+      quantity: item.quantity,
+      unitCost: item.unitCost ?? product?.unitCost ?? '0.00',
+      receivedQty: 0,
+    };
+  });
+}
 
-  if (!supplier) {
-    throw notFound('Supplier not found');
-  }
-  if (!warehouse) {
-    throw notFound('Warehouse not found');
-  }
-  if (products.length !== input.items.length) {
-    throw notFound('One or more products were not found');
-  }
+export async function createPurchaseOrder(organizationId: string, userId: string, input: CreateBody) {
+  const supplier = await findOne<SupplierDoc>(cols.suppliers, { _id: input.supplierId, organizationId });
+  const warehouse = await findOne<WarehouseDoc>(cols.warehouses, { _id: input.warehouseId, organizationId });
+  const products = await findMany<ProductDoc>(cols.products, {
+    organizationId,
+    _id: { $in: input.items.map((item) => item.productId) },
+  });
+  if (!supplier) throw notFound('Supplier not found');
+  if (!warehouse) throw notFound('Warehouse not found');
+  if (products.length !== input.items.length) throw notFound('One or more products were not found');
 
   if (input.recommendationId) {
-    const recommendation = await prisma.replenishmentRecommendation.findFirst({
-      where: { id: input.recommendationId, organizationId },
+    const recommendation = await findOne<RecommendationDoc>(cols.recommendations, {
+      _id: input.recommendationId,
+      organizationId,
     });
-    if (!recommendation) {
-      throw notFound('Recommendation not found');
-    }
-    if (recommendation.status !== 'APPROVED') {
-      throw conflict(
-        'RECOMMENDATION_NOT_APPROVED',
-        'Purchase orders can only be linked to approved recommendations',
-      );
+    if (!recommendation) throw notFound('Recommendation not found');
+    if (recommendation.status !== RecommendationStatus.APPROVED) {
+      throw conflict('RECOMMENDATION_NOT_APPROVED', 'Purchase orders can only be linked to approved recommendations');
     }
     if (recommendation.warehouseId !== input.warehouseId) {
       throw conflict('WAREHOUSE_MISMATCH', 'Recommendation warehouse does not match this order');
@@ -172,9 +202,9 @@ export async function createPurchaseOrder(
     if (!input.items.some((item) => item.productId === recommendation.productId)) {
       throw conflict('PRODUCT_MISMATCH', 'Recommendation product must be included on the order');
     }
-    const linked = await prisma.purchaseOrder.findFirst({
-      where: { organizationId, recommendationId: recommendation.id },
-      select: { id: true },
+    const linked = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, {
+      organizationId,
+      recommendationId: recommendation.id,
     });
     if (linked) {
       throw conflict('RECOMMENDATION_ALREADY_ORDERED', 'This recommendation already has a purchase order');
@@ -182,34 +212,22 @@ export async function createPurchaseOrder(
   }
 
   const productById = new Map(products.map((product) => [product.id, product]));
-  const order = await prisma.$transaction(async (tx) => {
-    const created = await tx.purchaseOrder.create({
-      data: {
-        organizationId,
-        supplierId: supplier.id,
-        warehouseId: warehouse.id,
-        recommendationId: input.recommendationId ?? null,
-        poNumber: createPoNumber(),
-        status: 'DRAFT',
-        notes: input.notes ?? null,
-        expectedAt: input.expectedAt ?? null,
-        createdById: userId,
-        items: {
-          create: input.items.map((item) => {
-            const product = productById.get(item.productId);
-            return {
-              organizationId,
-              productId: item.productId,
-              quantity: item.quantity,
-              unitCost: item.unitCost ?? product?.unitCost ?? '0.00',
-            };
-          }),
-        },
-      },
-      include: detailInclude,
+  const order = await withTransaction(async () => {
+    const created = await insertOne<PurchaseOrderDoc>(cols.purchaseOrders, {
+      organizationId,
+      supplierId: supplier.id,
+      warehouseId: warehouse.id,
+      ...(input.recommendationId ? { recommendationId: input.recommendationId } : { recommendationId: null }),
+      poNumber: createPoNumber(),
+      status: PurchaseOrderStatus.DRAFT,
+      notes: input.notes ?? null,
+      expectedAt: input.expectedAt ?? null,
+      createdById: userId,
+      approvedById: null,
+      orderedAt: null,
+      items: lineItems(organizationId, input, productById),
     });
-
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.PURCHASE_ORDER_CREATED,
@@ -220,7 +238,8 @@ export async function createPurchaseOrder(
     return created;
   });
 
-  return toPurchaseOrder(order);
+  const [view] = await hydrate([order]);
+  return toPurchaseOrder(view ?? { ...order, supplier, warehouse });
 }
 
 export async function updatePurchaseOrder(
@@ -230,13 +249,11 @@ export async function updatePurchaseOrder(
   id: string,
   input: UpdateBody,
 ) {
-  const existing = await prisma.purchaseOrder.findFirst({ where: { id, organizationId } });
-  if (!existing) {
-    throw notFound('Purchase order not found');
-  }
+  const existing = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, { _id: id, organizationId });
+  if (!existing) throw notFound('Purchase order not found');
 
   if (
-    (existing.status === 'RECEIVED' || existing.status === 'CANCELLED') &&
+    (existing.status === PurchaseOrderStatus.RECEIVED || existing.status === PurchaseOrderStatus.CANCELLED) &&
     (input.status || input.notes !== undefined || input.expectedAt !== undefined)
   ) {
     throw conflict('PO_CLOSED', 'Closed purchase orders cannot be modified');
@@ -245,44 +262,37 @@ export async function updatePurchaseOrder(
   if (input.status) {
     const allowed = TRANSITIONS[existing.status];
     if (!allowed.includes(input.status)) {
-      throw conflict(
-        'INVALID_TRANSITION',
-        `Cannot move a purchase order from ${existing.status} to ${input.status}`,
-      );
+      throw conflict('INVALID_TRANSITION', `Cannot move a purchase order from ${existing.status} to ${input.status}`);
     }
-    if (input.status === 'APPROVED' && !can(role, 'purchase_orders', 'approve')) {
+    if (input.status === PurchaseOrderStatus.APPROVED && !can(role, 'purchase_orders', 'approve')) {
       throw forbidden('Only owners and admins can approve purchase orders');
     }
   }
 
-  const order = await prisma.$transaction(async (tx) => {
-    const updated = await tx.purchaseOrder.updateMany({
-      where: { id, organizationId, status: existing.status },
-      data: {
+  const order = await withTransaction(async () => {
+    const updated = await patchOne(
+      cols.purchaseOrders,
+      { _id: id, organizationId, status: existing.status },
+      {
         ...(input.status ? { status: input.status } : {}),
         ...(input.notes !== undefined ? { notes: input.notes } : {}),
         ...(input.expectedAt !== undefined ? { expectedAt: input.expectedAt } : {}),
-        ...(input.status === 'APPROVED' ? { approvedById: userId } : {}),
-        ...(input.status === 'SENT' && !existing.orderedAt ? { orderedAt: new Date() } : {}),
+        ...(input.status === PurchaseOrderStatus.APPROVED ? { approvedById: userId } : {}),
+        ...(input.status === PurchaseOrderStatus.SENT && !existing.orderedAt ? { orderedAt: new Date() } : {}),
       },
-    });
-    if (updated.count === 0) {
+    );
+    if (updated === 0) {
       throw conflict('INVALID_TRANSITION', 'Purchase order status changed before this update');
     }
-    const fresh = await tx.purchaseOrder.findFirst({
-      where: { id, organizationId },
-      include: detailInclude,
-    });
-    if (!fresh) {
-      throw notFound('Purchase order not found');
-    }
+    const fresh = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, { _id: id, organizationId });
+    if (!fresh) throw notFound('Purchase order not found');
     const statusChanged = Boolean(input.status) && input.status !== existing.status;
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: !statusChanged
         ? AuditAction.PURCHASE_ORDER_UPDATED
-        : input.status === 'APPROVED'
+        : input.status === PurchaseOrderStatus.APPROVED
           ? AuditAction.PURCHASE_ORDER_APPROVED
           : AuditAction.PURCHASE_ORDER_STATUS_CHANGED,
       entityType: 'PurchaseOrder',
@@ -292,7 +302,7 @@ export async function updatePurchaseOrder(
     return fresh;
   });
 
-  if (input.status === 'APPROVED') {
+  if (input.status === PurchaseOrderStatus.APPROVED) {
     void publishEvent({
       name: DomainEventName.PO_APPROVED,
       organizationId,
@@ -302,108 +312,69 @@ export async function updatePurchaseOrder(
     });
   }
 
-  return toPurchaseOrder(order);
+  const [view] = await hydrate([order]);
+  return toPurchaseOrder(view ?? order);
 }
 
-export async function receivePurchaseOrder(
-  organizationId: string,
-  userId: string,
-  id: string,
-  input: ReceiveBody,
-) {
-  const order = await prisma.$transaction(async (tx) => {
-    const existing = await tx.purchaseOrder.findFirst({
-      where: { id, organizationId },
-      include: { items: true },
-    });
-    if (!existing) {
-      throw notFound('Purchase order not found');
-    }
-    if (
-      existing.status !== PurchaseOrderStatus.SENT &&
-      existing.status !== PurchaseOrderStatus.PARTIALLY_RECEIVED
-    ) {
-      throw conflict(
-        'INVALID_STATUS',
-        'Goods can only be received after the purchase order has been sent',
-      );
+async function addStock(organizationId: string, productId: string, warehouseId: string, quantity: number) {
+  const existing = await findOne<InventoryDoc>(cols.inventory, { productId, warehouseId });
+  if (existing) {
+    const matched = await patchOne(cols.inventory, { _id: existing.id, organizationId }, {}, { $inc: { quantity } });
+    if (matched === 0) throw notFound('Inventory position not found');
+    return;
+  }
+  await insertOne<InventoryDoc>(cols.inventory, {
+    organizationId,
+    productId,
+    warehouseId,
+    quantity,
+    reservedQty: 0,
+    reorderPoint: 0,
+  });
+}
+
+export async function receivePurchaseOrder(organizationId: string, userId: string, id: string, input: ReceiveBody) {
+  const order = await withTransaction(async () => {
+    const existing = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, { _id: id, organizationId });
+    if (!existing) throw notFound('Purchase order not found');
+    if (existing.status !== PurchaseOrderStatus.SENT && existing.status !== PurchaseOrderStatus.PARTIALLY_RECEIVED) {
+      throw conflict('INVALID_STATUS', 'Goods can only be received after the purchase order has been sent');
     }
 
-    const itemIds = new Set<string>();
+    const items = existing.items.map((item) => ({ ...item }));
+    const seen = new Set<string>();
     for (const line of input.items) {
-      if (itemIds.has(line.purchaseOrderItemId)) {
+      if (seen.has(line.purchaseOrderItemId)) {
         throw conflict('DUPLICATE_RECEIPT_LINE', 'Each purchase order line can be received once per request');
       }
-      itemIds.add(line.purchaseOrderItemId);
-
-      const item = existing.items.find(
-        (candidate) =>
-          candidate.id === line.purchaseOrderItemId && candidate.organizationId === organizationId,
-      );
-      if (!item) {
-        throw notFound('Purchase order item not found');
-      }
+      seen.add(line.purchaseOrderItemId);
+      const item = items.find((candidate) => candidate.id === line.purchaseOrderItemId && candidate.organizationId === organizationId);
+      if (!item) throw notFound('Purchase order item not found');
       if (item.receivedQty + line.quantity > item.quantity) {
         throw conflict('OVER_RECEIPT', 'Received quantity exceeds the ordered quantity');
       }
-
-      const updated = await tx.purchaseOrderItem.updateMany({
-        where: { id: item.id, organizationId, purchaseOrderId: existing.id },
-        data: { receivedQty: { increment: line.quantity } },
-      });
-      if (updated.count === 0) {
-        throw notFound('Purchase order item not found');
-      }
-
-      await tx.inventory.upsert({
-        where: {
-          productId_warehouseId: {
-            productId: item.productId,
-            warehouseId: existing.warehouseId,
-          },
-        },
-        create: {
-          organizationId,
-          productId: item.productId,
-          warehouseId: existing.warehouseId,
-          quantity: line.quantity,
-        },
-        update: { quantity: { increment: line.quantity } },
-      });
+      item.receivedQty += line.quantity;
+      await addStock(organizationId, item.productId, existing.warehouseId, line.quantity);
     }
 
-    const freshItems = await tx.purchaseOrderItem.findMany({
-      where: { purchaseOrderId: existing.id, organizationId },
-    });
-    const fullyReceived = freshItems.every((item) => item.receivedQty >= item.quantity);
-    const status = fullyReceived
-      ? PurchaseOrderStatus.RECEIVED
-      : PurchaseOrderStatus.PARTIALLY_RECEIVED;
+    const fullyReceived = items.every((item) => item.receivedQty >= item.quantity);
+    const status = fullyReceived ? PurchaseOrderStatus.RECEIVED : PurchaseOrderStatus.PARTIALLY_RECEIVED;
+    const matched = await patchOne(
+      cols.purchaseOrders,
+      { _id: existing.id, organizationId },
+      { status, items },
+    );
+    if (matched === 0) throw notFound('Purchase order not found');
+    const fresh = await findOne<PurchaseOrderDoc>(cols.purchaseOrders, { _id: existing.id, organizationId });
+    if (!fresh) throw notFound('Purchase order not found');
 
-    await tx.purchaseOrder.updateMany({
-      where: { id: existing.id, organizationId },
-      data: { status },
-    });
-
-    const fresh = await tx.purchaseOrder.findFirst({
-      where: { id: existing.id, organizationId },
-      include: detailInclude,
-    });
-    if (!fresh) {
-      throw notFound('Purchase order not found');
-    }
-
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.PURCHASE_ORDER_RECEIVED,
       entityType: 'PurchaseOrder',
       entityId: existing.id,
-      metadata: {
-        poNumber: existing.poNumber,
-        status,
-        lines: input.items.length,
-      },
+      metadata: { poNumber: existing.poNumber, status, lines: input.items.length },
     });
     return fresh;
   });
@@ -416,5 +387,6 @@ export async function receivePurchaseOrder(
     payload: { status: order.status },
   });
 
-  return toPurchaseOrder(order);
+  const [view] = await hydrate([order]);
+  return toPurchaseOrder(view ?? order);
 }

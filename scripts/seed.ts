@@ -1,9 +1,23 @@
 import 'dotenv/config';
-import { Prisma, PrismaClient, ProductStatus, UserRole } from '@prisma/client';
 import bcrypt from 'bcrypt';
+import { cols, disconnectMongo, findMany, insertMany, insertOne, newId } from '../apps/api/src/db/mongo';
+import type {
+  AuditLogDoc,
+  ForecastDoc,
+  InventoryDoc,
+  OrganizationDoc,
+  ProductDoc,
+  PurchaseOrderDoc,
+  RecommendationDoc,
+  SaleDoc,
+  SupplierDoc,
+  UserDoc,
+  WarehouseDoc,
+} from '../apps/api/src/domain/documents';
+import { ProductStatus, RecommendationStatus, UserRole } from '../apps/api/src/domain/enums';
+import { deleteTenant } from '../apps/api/src/lib/tenant-cleanup';
 import { buildPositionPlan, calendarDatesEnding } from '../apps/api/src/modules/intelligence/planner';
-
-const prisma = new PrismaClient();
+import { toDecimal } from '../apps/api/src/utils/money';
 const PASSWORD = 'Password123!';
 const DEMO_SLUG = 'nimbus-fmcg';
 const LOOKBACK_DAYS = 28;
@@ -107,35 +121,17 @@ function addUtcDays(date: Date, days: number): Date {
 }
 
 async function wipeDemo(): Promise<void> {
-  const orgs = await prisma.organization.findMany({
-    where: {
-      OR: [{ slug: DEMO_SLUG }, { users: { some: { email: { in: DEMO_USERS.map((user) => user.email) } } } }],
-    },
-    select: { id: true },
-  });
-
-  for (const org of orgs) {
-    const organizationId = org.id;
-    await prisma.$transaction(async (tx) => {
-      await tx.auditLog.deleteMany({ where: { organizationId } });
-      await tx.sale.deleteMany({ where: { organizationId } });
-      await tx.purchaseOrderItem.deleteMany({ where: { organizationId } });
-      await tx.purchaseOrder.deleteMany({ where: { organizationId } });
-      await tx.forecast.deleteMany({ where: { organizationId } });
-      await tx.replenishmentRecommendation.deleteMany({ where: { organizationId } });
-      await tx.inventory.deleteMany({ where: { organizationId } });
-      await tx.product.deleteMany({ where: { organizationId } });
-      await tx.warehouse.deleteMany({ where: { organizationId } });
-      await tx.supplier.deleteMany({ where: { organizationId } });
-      await tx.user.deleteMany({ where: { organizationId } });
-      await tx.organization.delete({ where: { id: organizationId } });
-    });
+  const orgs = await findMany<OrganizationDoc>(cols.organizations, { slug: DEMO_SLUG });
+  const users = await findMany<UserDoc>(cols.users, { email: { $in: DEMO_USERS.map((user) => user.email) } });
+  const organizationIds = new Set([...orgs.map((org) => org.id), ...users.map((user) => user.organizationId)]);
+  for (const organizationId of organizationIds) {
+    await deleteTenant(organizationId);
   }
 }
 
 async function main(): Promise<void> {
-  if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is required to seed Invorra');
+  if (!process.env.MONGODB_URI) {
+    throw new Error('MONGODB_URI is required to seed Invorra');
   }
 
   await wipeDemo();
@@ -144,20 +140,19 @@ async function main(): Promise<void> {
   const today = startOfUtcDay(new Date());
   const historyStart = addUtcDays(today, -(HISTORY_DAYS - 1));
 
-  const organization = await prisma.organization.create({
-    data: { name: 'Nimbus Consumer Goods', slug: DEMO_SLUG },
+  const organization = await insertOne<OrganizationDoc>(cols.organizations, {
+    name: 'Nimbus Consumer Goods',
+    slug: DEMO_SLUG,
   });
 
   const users = await Promise.all(
     DEMO_USERS.map((user) =>
-      prisma.user.create({
-        data: {
-          organizationId: organization.id,
-          email: user.email,
-          name: user.name,
-          role: user.role,
-          passwordHash,
-        },
+      insertOne<UserDoc>(cols.users, {
+        organizationId: organization.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        passwordHash,
       }),
     ),
   );
@@ -168,52 +163,46 @@ async function main(): Promise<void> {
 
   const products = await Promise.all(
     PRODUCTS.map((product, index) =>
-      prisma.product.create({
-        data: {
-          organizationId: organization.id,
-          sku: product.sku,
-          name: product.name,
-          category: product.category,
-          brand: product.brand,
-          unit: 'pcs',
-          unitCost: product.unitCost,
-          sellingPrice: product.sellingPrice,
-          status: ProductStatus.ACTIVE,
-          leadTimeDays: product.leadTimeDays,
-          reorderPoint: Math.ceil(product.baseDaily * product.leadTimeDays),
-          safetyStock: Math.ceil(product.baseDaily * 2),
-          moq: [12, 24, 48, 144][index % 4] ?? 12,
-        },
+      insertOne<ProductDoc>(cols.products, {
+        organizationId: organization.id,
+        sku: product.sku,
+        name: product.name,
+        category: product.category,
+        brand: product.brand,
+        unit: 'pcs',
+        unitCost: product.unitCost,
+        sellingPrice: product.sellingPrice,
+        status: ProductStatus.ACTIVE,
+        leadTimeDays: product.leadTimeDays,
+        reorderPoint: Math.ceil(product.baseDaily * product.leadTimeDays),
+        safetyStock: Math.ceil(product.baseDaily * 2),
+        moq: [12, 24, 48, 144][index % 4] ?? 12,
       }),
     ),
   );
 
   const warehouses = await Promise.all(
     WAREHOUSES.map((warehouse) =>
-      prisma.warehouse.create({
-        data: {
-          organizationId: organization.id,
-          name: warehouse.name,
-          code: warehouse.code,
-          city: warehouse.city,
-          state: warehouse.state,
-          address: warehouse.address,
-        },
+      insertOne<WarehouseDoc>(cols.warehouses, {
+        organizationId: organization.id,
+        name: warehouse.name,
+        code: warehouse.code,
+        city: warehouse.city,
+        state: warehouse.state,
+        address: warehouse.address,
       }),
     ),
   );
 
   const suppliers = await Promise.all(
     SUPPLIERS.map((supplier) =>
-      prisma.supplier.create({
-        data: { organizationId: organization.id, ...supplier },
-      }),
+      insertOne<SupplierDoc>(cols.suppliers, { organizationId: organization.id, email: supplier.email, phone: supplier.phone, city: supplier.city, leadTimeDays: supplier.leadTimeDays, name: supplier.name, code: supplier.code }),
     ),
   );
 
   const recentUnits = new Map<string, number>();
   const dailyUnits = new Map<string, Map<string, number>>();
-  const sales: Prisma.SaleCreateManyInput[] = [];
+  const sales: Array<Omit<SaleDoc, 'id' | 'createdAt' | 'updatedAt'>> = [];
 
   for (let dayIndex = 0; dayIndex < HISTORY_DAYS; dayIndex += 1) {
     const soldAt = addUtcDays(historyStart, dayIndex);
@@ -261,7 +250,7 @@ async function main(): Promise<void> {
           recordedById: owner.id,
           quantity,
           unitPrice: product.sellingPrice,
-          totalAmount: new Prisma.Decimal(product.sellingPrice).mul(quantity),
+          totalAmount: toDecimal(product.sellingPrice).mul(quantity).toFixed(2),
           channel: CHANNELS[(productIndex + warehouseIndex + dayIndex) % CHANNELS.length] ?? 'quick-commerce',
           soldAt,
         });
@@ -270,12 +259,12 @@ async function main(): Promise<void> {
   }
 
   for (let offset = 0; offset < sales.length; offset += 1000) {
-    await prisma.sale.createMany({ data: sales.slice(offset, offset + 1000) });
+    await insertMany<SaleDoc>(cols.sales, sales.slice(offset, offset + 1000));
   }
 
-  const inventoryRows: Prisma.InventoryCreateManyInput[] = [];
-  const recommendationRows: Prisma.ReplenishmentRecommendationCreateManyInput[] = [];
-  const forecastRows: Prisma.ForecastCreateManyInput[] = [];
+  const inventoryRows: Array<Omit<InventoryDoc, 'id' | 'createdAt' | 'updatedAt'>> = [];
+  const recommendationRows: Array<Omit<RecommendationDoc, 'id' | 'createdAt' | 'updatedAt'>> = [];
+  const forecastRows: Array<Omit<ForecastDoc, 'id' | 'createdAt' | 'updatedAt'>> = [];
 
   PRODUCTS.forEach((product, productIndex) => {
     WAREHOUSES.forEach((warehouse, warehouseIndex) => {
@@ -353,7 +342,7 @@ async function main(): Promise<void> {
           rawOrderQuantity: plan.rawOrderQuantity,
           planningHorizonDays: 14,
           riskLevel,
-          status: 'PENDING',
+          status: RecommendationStatus.PENDING,
           expiresAt: addUtcDays(today, 7),
           rationale: plan.explanation,
         });
@@ -361,14 +350,12 @@ async function main(): Promise<void> {
     });
   });
 
-  await prisma.inventory.createMany({ data: inventoryRows });
-  if (forecastRows.length > 0) {
-    for (let offset = 0; offset < forecastRows.length; offset += 1000) {
-      await prisma.forecast.createMany({ data: forecastRows.slice(offset, offset + 1000) });
-    }
+  await insertMany<InventoryDoc>(cols.inventory, inventoryRows);
+  for (let offset = 0; offset < forecastRows.length; offset += 1000) {
+    await insertMany<ForecastDoc>(cols.forecasts, forecastRows.slice(offset, offset + 1000));
   }
   if (recommendationRows.length > 0) {
-    await prisma.replenishmentRecommendation.createMany({ data: recommendationRows });
+    await insertMany<RecommendationDoc>(cols.recommendations, recommendationRows);
   }
 
   const milk = products.find((product) => product.sku === 'NB-MILK-500');
@@ -380,45 +367,47 @@ async function main(): Promise<void> {
     );
     const average = (recentUnits.get('NB-MILK-500:DEL-01') ?? 0) / LOOKBACK_DAYS;
     const orderQty = Math.max(1, Math.ceil(average * 21 - (milkStock?.quantity ?? 0)));
-    await prisma.purchaseOrder.create({
-      data: {
-        organizationId: organization.id,
-        supplierId: supplier.id,
-        warehouseId: delhi.id,
-        poNumber: 'PO-DEMO-MILK-DEL',
-        status: 'PENDING_APPROVAL',
-        createdById: owner.id,
-        expectedAt: addUtcDays(today, supplier.leadTimeDays),
-        notes: 'Demo replenishment for Delhi toned milk',
-        items: {
-          create: {
-            organizationId: organization.id,
-            productId: milk.id,
-            quantity: orderQty,
-            unitCost: milk.unitCost,
-          },
+    await insertOne<PurchaseOrderDoc>(cols.purchaseOrders, {
+      organizationId: organization.id,
+      supplierId: supplier.id,
+      warehouseId: delhi.id,
+      recommendationId: null,
+      poNumber: 'PO-DEMO-MILK-DEL',
+      status: 'PENDING_APPROVAL',
+      createdById: owner.id,
+      approvedById: null,
+      orderedAt: null,
+      expectedAt: addUtcDays(today, supplier.leadTimeDays),
+      notes: 'Demo replenishment for Delhi toned milk',
+      items: [
+        {
+          id: newId(),
+          organizationId: organization.id,
+          productId: milk.id,
+          quantity: orderQty,
+          unitCost: milk.unitCost,
+          receivedQty: 0,
         },
-      },
+      ],
     });
   }
 
-  await prisma.auditLog.create({
-    data: {
-      organizationId: organization.id,
-      userId: owner.id,
-      action: 'SEED_COMPLETED',
-      entityType: 'Organization',
-      entityId: organization.id,
-      metadata: {
-        products: products.length,
-        warehouses: warehouses.length,
-        suppliers: suppliers.length,
-        sales: sales.length,
-        inventory: inventoryRows.length,
-        forecasts: forecastRows.length,
-        recommendations: recommendationRows.length,
-      },
+  await insertOne<AuditLogDoc>(cols.auditLogs, {
+    organizationId: organization.id,
+    userId: owner.id,
+    action: 'SEED_COMPLETED',
+    entityType: 'Organization',
+    entityId: organization.id,
+    metadata: {
+      products: products.length,
+      warehouses: warehouses.length,
+      suppliers: suppliers.length,
+      sales: sales.length,
+      inventory: inventoryRows.length,
+      forecasts: forecastRows.length,
+      recommendations: recommendationRows.length,
     },
+    ipAddress: null,
   });
 
   console.log('Seeded Nimbus Consumer Goods');
@@ -434,5 +423,5 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await prisma.$disconnect();
+    await disconnectMongo();
   });

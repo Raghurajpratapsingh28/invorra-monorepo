@@ -1,21 +1,25 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: invorra-postgres
+  mongo:
+    image: mongo:7
+    container_name: invorra-mongo
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-invorra}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invorra}
-      POSTGRES_DB: ${POSTGRES_DB:-invorra}
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "27017:27017"
     volumes:
-      - invorra_pg_data:/var/lib/postgresql/data
+      - invorra_mongo_data:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invorra} -d ${POSTGRES_DB:-invorra}"]
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "--eval",
+          "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'127.0.0.1:27017'}]}) }",
+        ]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout: 10s
+      retries: 20
 
   nats:
     image: nats:2.11-alpine
@@ -30,7 +34,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-invorra}:${POSTGRES_PASSWORD:-invorra}@postgres:5432/${POSTGRES_DB:-invorra}?schema=public
+      MONGODB_URI: mongodb://mongo:27017/invorra?replicaSet=rs0&directConnection=true
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       PORT: 4000
       NODE_ENV: production
@@ -42,7 +46,7 @@ services:
     ports:
       - "4000:4000"
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
       ml:
         condition: service_healthy
@@ -71,4 +75,4 @@ services:
       retries: 10
 
 volumes:
-  invorra_pg_data:
+  invorra_mongo_data:

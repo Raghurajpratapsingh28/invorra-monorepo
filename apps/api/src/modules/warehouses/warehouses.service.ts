@@ -1,20 +1,27 @@
-import { Prisma, Warehouse } from '@prisma/client';
 import { z } from 'zod';
+import {
+  cols,
+  contains,
+  countDocs,
+  equalsIgnoreCase,
+  findMany,
+  findOne,
+  insertOne,
+  patchMany,
+  removeMany,
+  withTransaction,
+} from '../../db/mongo';
+import type { WarehouseDoc } from '../../domain/documents';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
 import { conflict, notFound } from '../../utils/errors';
 import { toPagination, toSkip } from '../../utils/pagination';
-import type {
-  createWarehouseSchema,
-  listWarehousesSchema,
-  updateWarehouseSchema,
-} from './warehouses.schema';
+import type { createWarehouseSchema, listWarehousesSchema, updateWarehouseSchema } from './warehouses.schema';
 
 type ListQuery = z.infer<typeof listWarehousesSchema>['query'];
 type CreateBody = z.infer<typeof createWarehouseSchema>['body'];
 type UpdateBody = z.infer<typeof updateWarehouseSchema>['body'];
 
-export function toWarehouse(warehouse: Warehouse) {
+export function toWarehouse(warehouse: WarehouseDoc) {
   return {
     id: warehouse.id,
     organizationId: warehouse.organizationId,
@@ -29,38 +36,26 @@ export function toWarehouse(warehouse: Warehouse) {
 }
 
 export async function listWarehouses(organizationId: string, query: ListQuery) {
-  const where: Prisma.WarehouseWhereInput = {
+  const filter = {
     organizationId,
-    ...(query.city ? { city: { equals: query.city, mode: 'insensitive' } } : {}),
+    ...(query.city ? { city: equalsIgnoreCase(query.city) } : {}),
     ...(query.search
-      ? {
-          OR: [
-            { name: { contains: query.search, mode: 'insensitive' } },
-            { code: { contains: query.search, mode: 'insensitive' } },
-            { city: { contains: query.search, mode: 'insensitive' } },
-          ],
-        }
+      ? { $or: [{ name: contains(query.search) }, { code: contains(query.search) }, { city: contains(query.search) }] }
       : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.warehouse.count({ where }),
-    prisma.warehouse.findMany({
-      where,
-      orderBy: [{ city: 'asc' }, { name: 'asc' }],
+  const [total, rows] = await Promise.all([
+    countDocs(cols.warehouses, filter),
+    findMany<WarehouseDoc>(cols.warehouses, filter, {
+      sort: { city: 1, name: 1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
+      limit: query.limit,
     }),
   ]);
-
-  return {
-    items: rows.map(toWarehouse),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map(toWarehouse), pagination: toPagination(query.page, query.limit, total) };
 }
 
 export async function getWarehouse(organizationId: string, id: string) {
-  const warehouse = await prisma.warehouse.findFirst({ where: { id, organizationId } });
+  const warehouse = await findOne<WarehouseDoc>(cols.warehouses, { _id: id, organizationId });
   if (!warehouse) {
     throw notFound('Warehouse not found');
   }
@@ -68,26 +63,20 @@ export async function getWarehouse(organizationId: string, id: string) {
 }
 
 export async function createWarehouse(organizationId: string, userId: string, input: CreateBody) {
-  const duplicate = await prisma.warehouse.findFirst({
-    where: { organizationId, code: input.code },
-    select: { id: true },
-  });
+  const duplicate = await findOne<WarehouseDoc>(cols.warehouses, { organizationId, code: input.code });
   if (duplicate) {
     throw conflict('WAREHOUSE_CODE_CONFLICT', 'Warehouse code already exists in this organization');
   }
-
-  const warehouse = await prisma.$transaction(async (tx) => {
-    const created = await tx.warehouse.create({
-      data: {
-        organizationId,
-        name: input.name,
-        code: input.code,
-        city: input.city,
-        state: input.state ?? null,
-        address: input.address ?? null,
-      },
+  const warehouse = await withTransaction(async () => {
+    const created = await insertOne<WarehouseDoc>(cols.warehouses, {
+      organizationId,
+      name: input.name,
+      code: input.code,
+      city: input.city,
+      state: input.state ?? null,
+      address: input.address ?? null,
     });
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.WAREHOUSE_CREATED,
@@ -97,50 +86,40 @@ export async function createWarehouse(organizationId: string, userId: string, in
     });
     return created;
   });
-
   return toWarehouse(warehouse);
 }
 
-export async function updateWarehouse(
-  organizationId: string,
-  userId: string,
-  id: string,
-  input: UpdateBody,
-) {
-  const existing = await prisma.warehouse.findFirst({ where: { id, organizationId } });
+export async function updateWarehouse(organizationId: string, userId: string, id: string, input: UpdateBody) {
+  const existing = await findOne<WarehouseDoc>(cols.warehouses, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Warehouse not found');
   }
-
   if (input.code && input.code !== existing.code) {
-    const duplicate = await prisma.warehouse.findFirst({
-      where: { organizationId, code: input.code, NOT: { id } },
-      select: { id: true },
+    const duplicate = await findOne<WarehouseDoc>(cols.warehouses, {
+      organizationId,
+      code: input.code,
+      _id: { $ne: id },
     });
     if (duplicate) {
       throw conflict('WAREHOUSE_CODE_CONFLICT', 'Warehouse code already exists in this organization');
     }
   }
-
-  const warehouse = await prisma.$transaction(async (tx) => {
-    const updated = await tx.warehouse.updateMany({
-      where: { id, organizationId },
-      data: {
-        ...(input.name !== undefined ? { name: input.name } : {}),
-        ...(input.code !== undefined ? { code: input.code } : {}),
-        ...(input.city !== undefined ? { city: input.city } : {}),
-        ...(input.state !== undefined ? { state: input.state } : {}),
-        ...(input.address !== undefined ? { address: input.address } : {}),
-      },
+  const warehouse = await withTransaction(async () => {
+    const updated = await patchMany(cols.warehouses, { _id: id, organizationId }, {
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.code !== undefined ? { code: input.code } : {}),
+      ...(input.city !== undefined ? { city: input.city } : {}),
+      ...(input.state !== undefined ? { state: input.state } : {}),
+      ...(input.address !== undefined ? { address: input.address } : {}),
     });
-    if (updated.count === 0) {
+    if (updated === 0) {
       throw notFound('Warehouse not found');
     }
-    const fresh = await tx.warehouse.findFirst({ where: { id, organizationId } });
+    const fresh = await findOne<WarehouseDoc>(cols.warehouses, { _id: id, organizationId });
     if (!fresh) {
       throw notFound('Warehouse not found');
     }
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.WAREHOUSE_UPDATED,
@@ -150,34 +129,27 @@ export async function updateWarehouse(
     });
     return fresh;
   });
-
   return toWarehouse(warehouse);
 }
 
 export async function deleteWarehouse(organizationId: string, userId: string, id: string) {
-  const existing = await prisma.warehouse.findFirst({ where: { id, organizationId } });
+  const existing = await findOne<WarehouseDoc>(cols.warehouses, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Warehouse not found');
   }
-
   const [sales, purchaseOrders] = await Promise.all([
-    prisma.sale.count({ where: { organizationId, warehouseId: id } }),
-    prisma.purchaseOrder.count({ where: { organizationId, warehouseId: id } }),
+    countDocs(cols.sales, { organizationId, warehouseId: id }),
+    countDocs(cols.purchaseOrders, { organizationId, warehouseId: id }),
   ]);
-
   if (sales > 0 || purchaseOrders > 0) {
-    throw conflict(
-      'WAREHOUSE_IN_USE',
-      'Cannot delete a warehouse with sales or purchase order history.',
-    );
+    throw conflict('WAREHOUSE_IN_USE', 'Cannot delete a warehouse with sales or purchase order history.');
   }
-
-  await prisma.$transaction(async (tx) => {
-    const deleted = await tx.warehouse.deleteMany({ where: { id, organizationId } });
-    if (deleted.count === 0) {
+  await withTransaction(async () => {
+    const deleted = await removeMany(cols.warehouses, { _id: id, organizationId });
+    if (deleted === 0) {
       throw notFound('Warehouse not found');
     }
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.WAREHOUSE_DELETED,
@@ -186,6 +158,5 @@ export async function deleteWarehouse(organizationId: string, userId: string, id
       metadata: { code: existing.code },
     });
   });
-
   return { id, deleted: true as const };
 }

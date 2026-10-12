@@ -1,4 +1,4 @@
-import { ProductStatus } from '@prisma/client';
+import { ProductStatus } from '../../domain/enums';
 import { z } from 'zod';
 import {
   idSchema,

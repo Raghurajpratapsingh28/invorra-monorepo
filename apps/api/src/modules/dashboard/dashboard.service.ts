@@ -1,5 +1,6 @@
-import { Prisma, PurchaseOrderStatus, RiskLevel } from '@prisma/client';
-import { prisma } from '../../lib/prisma';
+import { cols, countDocs, findMany, mapByIds, aggregate } from '../../db/mongo';
+import type { InventoryDoc, ProductDoc, WarehouseDoc } from '../../domain/documents';
+import { PurchaseOrderStatus, RiskLevel } from '../../domain/enums';
 import { addUtcDays, daysAgo, startOfUtcDay } from '../../utils/dates';
 import { decimalToString, toDecimal } from '../../utils/money';
 import { calendarDatesEnding } from '../intelligence/planner';
@@ -14,49 +15,67 @@ const OPEN_STATUSES: PurchaseOrderStatus[] = [
 ];
 
 async function salesWindow(organizationId: string, since: Date) {
-  const aggregate = await prisma.sale.aggregate({
-    where: { organizationId, soldAt: { gte: since } },
-    _sum: { quantity: true, totalAmount: true },
-    _count: { _all: true },
-  });
-
+  const rows = await aggregate<{ orders: number; units: number; revenue: string }>(cols.sales, [
+    { $match: { organizationId, soldAt: { $gte: since } } },
+    {
+      $group: {
+        _id: null,
+        orders: { $sum: 1 },
+        units: { $sum: '$quantity' },
+        revenue: { $sum: { $toDecimal: '$totalAmount' } },
+      },
+    },
+  ]);
+  const aggregateRow = rows[0];
   return {
-    orders: aggregate._count._all,
-    units: aggregate._sum.quantity ?? 0,
-    revenue: decimalToString(aggregate._sum.totalAmount ?? 0),
+    orders: Number(aggregateRow?.orders ?? 0),
+    units: Number(aggregateRow?.units ?? 0),
+    revenue: decimalToString(aggregateRow?.revenue?.toString() ?? 0),
   };
 }
 
 export async function getDashboardSummary(organizationId: string, rangeDays = 30) {
-  const [products, warehouses, suppliers, inventoryRows, sales7, sales30, rangeSales, openPurchaseOrders, pendingApproval, pendingRecommendations, health] =
+  const since = daysAgo(rangeDays);
+  const [products, warehouses, suppliers, inventoryRows, sales7, sales30, rangeSales, openPurchaseOrders, pendingApproval, pendingRecommendations, health, productSales, warehouseSales] =
     await Promise.all([
-      prisma.product.count({ where: { organizationId, status: 'ACTIVE' } }),
-      prisma.warehouse.count({ where: { organizationId } }),
-      prisma.supplier.count({ where: { organizationId } }),
-      prisma.inventory.findMany({
-        where: { organizationId },
-        select: { quantity: true, product: { select: { unitCost: true } } },
-      }),
+      countDocs(cols.products, { organizationId, status: 'ACTIVE' }),
+      countDocs(cols.warehouses, { organizationId }),
+      countDocs(cols.suppliers, { organizationId }),
+      findMany<InventoryDoc>(cols.inventory, { organizationId }),
       salesWindow(organizationId, daysAgo(7)),
       salesWindow(organizationId, daysAgo(30)),
-      salesWindow(organizationId, daysAgo(rangeDays)),
-      prisma.purchaseOrder.count({
-        where: { organizationId, status: { in: OPEN_STATUSES } },
-      }),
-      prisma.purchaseOrder.count({
-        where: { organizationId, status: PurchaseOrderStatus.PENDING_APPROVAL },
-      }),
-      prisma.replenishmentRecommendation.count({
-        where: { organizationId, status: 'PENDING' },
-      }),
+      salesWindow(organizationId, since),
+      countDocs(cols.purchaseOrders, { organizationId, status: { $in: OPEN_STATUSES } }),
+      countDocs(cols.purchaseOrders, { organizationId, status: PurchaseOrderStatus.PENDING_APPROVAL }),
+      countDocs(cols.recommendations, { organizationId, status: 'PENDING' }),
       getInventoryHealth(organizationId),
+      aggregate<{ _id: string; units: number; revenue: { toString(): string } }>(cols.sales, [
+        { $match: { organizationId, soldAt: { $gte: since } } },
+        { $group: { _id: '$productId', units: { $sum: '$quantity' }, revenue: { $sum: { $toDecimal: '$totalAmount' } } } },
+        { $sort: { revenue: -1 } },
+        { $limit: 5 },
+      ]),
+      aggregate<{ _id: string; units: number; revenue: { toString(): string } }>(cols.sales, [
+        { $match: { organizationId, soldAt: { $gte: since } } },
+        { $group: { _id: '$warehouseId', units: { $sum: '$quantity' }, revenue: { $sum: { $toDecimal: '$totalAmount' } } } },
+        { $sort: { revenue: -1 } },
+        { $limit: 5 },
+      ]),
     ]);
 
+  const productDocs = await mapByIds<ProductDoc>(
+    cols.products,
+    inventoryRows.map((row) => row.productId).concat(productSales.map((row) => row._id)),
+  );
+  const warehouseDocs = await mapByIds<WarehouseDoc>(
+    cols.warehouses,
+    warehouseSales.map((row) => row._id),
+  );
+
   const inventoryValue = inventoryRows.reduce((sum, row) => {
-    if (row.quantity <= 0) {
-      return sum;
-    }
-    return sum.plus(toDecimal(row.quantity).mul(row.product.unitCost));
+    if (row.quantity <= 0) return sum;
+    const unitCost = productDocs.get(row.productId)?.unitCost ?? '0';
+    return sum.plus(toDecimal(row.quantity).mul(unitCost));
   }, toDecimal(0));
 
   const riskCounts = { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 };
@@ -64,46 +83,17 @@ export async function getDashboardSummary(organizationId: string, rangeDays = 30
     riskCounts[row.riskLevel] += 1;
   }
 
-  const since = daysAgo(rangeDays);
-  const [productSales, warehouseSales] = await Promise.all([
-    prisma.sale.groupBy({
-      by: ['productId'],
-      where: { organizationId, soldAt: { gte: since } },
-      _sum: { quantity: true, totalAmount: true },
-      orderBy: { _sum: { totalAmount: 'desc' } },
-      take: 5,
-    }),
-    prisma.sale.groupBy({
-      by: ['warehouseId'],
-      where: { organizationId, soldAt: { gte: since } },
-      _sum: { quantity: true, totalAmount: true },
-      orderBy: { _sum: { totalAmount: 'desc' } },
-      take: 5,
-    }),
-  ]);
-  const [productNames, warehouseNames] = await Promise.all([
-    prisma.product.findMany({
-      where: { organizationId, id: { in: productSales.map((row) => row.productId) } },
-      select: { id: true, sku: true, name: true },
-    }),
-    prisma.warehouse.findMany({
-      where: { organizationId, id: { in: warehouseSales.map((row) => row.warehouseId) } },
-      select: { id: true, name: true, city: true },
-    }),
-  ]);
-  const productById = new Map(productNames.map((product) => [product.id, product]));
-  const warehouseById = new Map(warehouseNames.map((warehouse) => [warehouse.id, warehouse]));
   const topProducts = productSales.map((row) => ({
-    sku: productById.get(row.productId)?.sku ?? row.productId,
-    name: productById.get(row.productId)?.name ?? 'Product',
-    units: row._sum.quantity ?? 0,
-    revenue: decimalToString(row._sum.totalAmount ?? 0),
+    sku: productDocs.get(row._id)?.sku ?? row._id,
+    name: productDocs.get(row._id)?.name ?? 'Product',
+    units: Number(row.units ?? 0),
+    revenue: decimalToString(row.revenue?.toString() ?? 0),
   }));
   const warehousePerformance = warehouseSales.map((row) => ({
-    name: warehouseById.get(row.warehouseId)?.name ?? 'Warehouse',
-    city: warehouseById.get(row.warehouseId)?.city ?? '',
-    units: row._sum.quantity ?? 0,
-    revenue: decimalToString(row._sum.totalAmount ?? 0),
+    name: warehouseDocs.get(row._id)?.name ?? 'Warehouse',
+    city: warehouseDocs.get(row._id)?.city ?? '',
+    units: Number(row.units ?? 0),
+    revenue: decimalToString(row.revenue?.toString() ?? 0),
   }));
 
   return {
@@ -112,18 +102,10 @@ export async function getDashboardSummary(organizationId: string, rangeDays = 30
     suppliers,
     inventoryPositions: inventoryRows.length,
     inventoryValue: decimalToString(inventoryValue),
-    sales: {
-      last7Days: sales7,
-      last30Days: sales30,
-    },
+    sales: { last7Days: sales7, last30Days: sales30 },
     riskCounts,
-    purchaseOrders: {
-      open: openPurchaseOrders,
-      pendingApproval,
-    },
-    recommendations: {
-      pending: pendingRecommendations,
-    },
+    purchaseOrders: { open: openPurchaseOrders, pendingApproval },
+    recommendations: { pending: pendingRecommendations },
     revenue: rangeSales.revenue,
     rangeDays,
     rangeSales,
@@ -139,23 +121,23 @@ export async function getDashboardSummary(organizationId: string, rangeDays = 30
 export async function getSalesSeries(organizationId: string, days: number) {
   const end = startOfUtcDay(new Date());
   const start = addUtcDays(end, -(days - 1));
-  const rows = await prisma.$queryRaw<Array<{ day: string; units: number; revenue: Prisma.Decimal }>>`
-    SELECT to_char(("soldAt" AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day,
-           SUM("quantity")::int AS units,
-           SUM("totalAmount") AS revenue
-    FROM "Sale"
-    WHERE "organizationId" = ${organizationId}
-      AND "soldAt" >= ${start}
-    GROUP BY day
-    ORDER BY day
-  `;
-  const byDay = new Map(rows.map((row) => [String(row.day), row]));
+  const rows = await aggregate<{ _id: string; units: number; revenue: { toString(): string } }>(cols.sales, [
+    { $match: { organizationId, soldAt: { $gte: start } } },
+    {
+      $group: {
+        _id: { $dateToString: { format: '%Y-%m-%d', date: '$soldAt', timezone: 'UTC' } },
+        units: { $sum: '$quantity' },
+        revenue: { $sum: { $toDecimal: '$totalAmount' } },
+      },
+    },
+  ]);
+  const byDay = new Map(rows.map((row) => [String(row._id), row]));
   return calendarDatesEnding(end.toISOString().slice(0, 10), days).map((date) => {
     const row = byDay.get(date);
     return {
       date,
       units: Number(row?.units ?? 0),
-      revenue: decimalToString(row?.revenue ?? 0),
+      revenue: decimalToString(row?.revenue?.toString() ?? 0),
     };
   });
 }
@@ -167,7 +149,6 @@ export async function getInventoryHealthSummary(organizationId: string) {
     string,
     { warehouseId: string; warehouseName: string; city: string; LOW: number; MEDIUM: number; HIGH: number; CRITICAL: number }
   >();
-
   for (const row of health) {
     riskCounts[row.riskLevel] += 1;
     const current = warehouses.get(row.warehouseId) ?? {
@@ -182,11 +163,7 @@ export async function getInventoryHealthSummary(organizationId: string) {
     current[row.riskLevel] += 1;
     warehouses.set(row.warehouseId, current);
   }
-
-  return {
-    riskCounts,
-    byWarehouse: [...warehouses.values()],
-  };
+  return { riskCounts, byWarehouse: [...warehouses.values()] };
 }
 
 export async function getStockoutRisks(organizationId: string, limit = 12) {

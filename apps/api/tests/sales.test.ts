@@ -1,5 +1,6 @@
 import { afterAll, expect, it } from 'vitest';
-import { prisma } from '../src/lib/prisma';
+import { cols, countDocs, findOne } from '../src/db/mongo';
+import type { AuditLogDoc, InventoryDoc } from '../src/domain/documents';
 import { cleanupOrganization, loginAs, registerOwner } from './helpers';
 
 const organizationIds: string[] = [];
@@ -44,22 +45,22 @@ it('decrements inventory in a transaction and refuses to go negative', async () 
   expect(sale.body.data.totalAmount).toBe('180.00');
   expect(sale.body.data.remainingQuantity).toBe(6);
 
-  const stock = await prisma.inventory.findFirst({
-    where: { id: inventory.body.data.id, organizationId: session.user.organizationId },
+  const stock = await findOne<InventoryDoc>(cols.inventory, {
+    _id: inventory.body.data.id,
+    organizationId: session.user.organizationId,
   });
   expect(stock?.quantity).toBe(6);
 
-  const audit = await prisma.auditLog.findFirst({
-    where: {
-      organizationId: session.user.organizationId,
-      entityId: sale.body.data.id,
-      action: 'SALE_RECORDED',
-    },
+  const audit = await findOne<AuditLogDoc>(cols.auditLogs, {
+    organizationId: session.user.organizationId,
+    entityId: sale.body.data.id,
+    action: 'SALE_RECORDED',
   });
   expect(audit).not.toBeNull();
 
-  const before = await prisma.sale.count({
-    where: { organizationId: session.user.organizationId, productId: product.body.data.id },
+  const before = await countDocs(cols.sales, {
+    organizationId: session.user.organizationId,
+    productId: product.body.data.id,
   });
   const rejected = await session.agent.post('/api/sales').send({
     productId: product.body.data.id,
@@ -69,11 +70,13 @@ it('decrements inventory in a transaction and refuses to go negative', async () 
   expect(rejected.status).toBe(409);
   expect(rejected.body.error.code).toBe('INSUFFICIENT_STOCK');
 
-  const after = await prisma.sale.count({
-    where: { organizationId: session.user.organizationId, productId: product.body.data.id },
+  const after = await countDocs(cols.sales, {
+    organizationId: session.user.organizationId,
+    productId: product.body.data.id,
   });
-  const stockAfter = await prisma.inventory.findFirst({
-    where: { id: inventory.body.data.id, organizationId: session.user.organizationId },
+  const stockAfter = await findOne<InventoryDoc>(cols.inventory, {
+    _id: inventory.body.data.id,
+    organizationId: session.user.organizationId,
   });
   expect(after).toBe(before);
   expect(stockAfter?.quantity).toBe(6);

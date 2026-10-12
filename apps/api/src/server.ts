@@ -1,7 +1,7 @@
 import { app } from './app';
 import { env } from './config/env';
 import { logger } from './lib/logger';
-import { prisma } from './lib/prisma';
+import { disconnectMongo } from './db/mongo';
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT, env: env.NODE_ENV }, 'Invorra API listening');
@@ -15,7 +15,7 @@ server.on('error', (error) => {
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Shutting down Invorra API');
   server.close(async () => {
-    await prisma.$disconnect();
+    await disconnectMongo();
     process.exit(0);
   });
   setTimeout(() => {

@@ -1,4 +1,4 @@
-import type { UserRole } from '@prisma/client';
+import type { UserRole } from '../domain/enums';
 
 export type AuthUser = {
   userId: string;

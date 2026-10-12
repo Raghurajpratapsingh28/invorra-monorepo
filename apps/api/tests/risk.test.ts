@@ -1,4 +1,4 @@
-import { RiskLevel } from '@prisma/client';
+import { RiskLevel } from '../src/domain/enums';
 import { afterAll, expect, it } from 'vitest';
 import { DEMAND_LOOKBACK_DAYS } from '../src/config/business';
 import { classifyRisk, daysOfInventory } from '../src/utils/risk';

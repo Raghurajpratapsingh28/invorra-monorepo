@@ -1,52 +1,61 @@
-import { Prisma, UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { DEMAND_LOOKBACK_DAYS } from '../../config/business';
 import { can } from '../../config/permissions';
+import { aggregate, cols, countDocs, findMany, findOne, insertOne, mapByIds, patchMany, withTransaction } from '../../db/mongo';
+import type { InventoryDoc, ProductDoc, WarehouseDoc } from '../../domain/documents';
+import type { UserRole } from '../../domain/enums';
 import { publishEvent } from '../../events/publisher';
 import { DomainEventName } from '../../events/types';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
 import { daysAgo } from '../../utils/dates';
 import { conflict, forbidden, notFound } from '../../utils/errors';
 import { decimalToString } from '../../utils/money';
 import { toPagination, toSkip } from '../../utils/pagination';
+import { daysOfInventory, riskRank, roundTo } from '../../utils/risk';
 import { loadDailyDemand, seriesFor } from '../intelligence/history';
 import { applyLeadTimeRisk, buildPositionPlan, stockoutProbability } from '../intelligence/planner';
-import { daysOfInventory, riskRank, roundTo } from '../../utils/risk';
-import type {
-  createInventorySchema,
-  inventoryRisksSchema,
-  listInventorySchema,
-  updateInventorySchema,
-} from './inventory.schema';
+import type { createInventorySchema, inventoryRisksSchema, listInventorySchema, updateInventorySchema } from './inventory.schema';
 
 type ListQuery = z.infer<typeof listInventorySchema>['query'];
 type RiskQuery = z.infer<typeof inventoryRisksSchema>['query'];
 type CreateBody = z.infer<typeof createInventorySchema>['body'];
 type UpdateBody = z.infer<typeof updateInventorySchema>['body'];
 
-const inventoryInclude = {
-  product: {
-    select: {
-      id: true,
-      sku: true,
-      name: true,
-      unit: true,
-      unitCost: true,
-      sellingPrice: true,
-      status: true,
-      leadTimeDays: true,
-      moq: true,
-    },
-  },
-  warehouse: {
-    select: { id: true, code: true, name: true, city: true },
-  },
-} satisfies Prisma.InventoryInclude;
+type InventoryView = InventoryDoc & {
+  product: Pick<ProductDoc, 'id' | 'sku' | 'name' | 'unit' | 'unitCost' | 'sellingPrice' | 'status' | 'leadTimeDays' | 'moq'>;
+  warehouse: Pick<WarehouseDoc, 'id' | 'code' | 'name' | 'city'>;
+};
 
-type InventoryWithRelations = Prisma.InventoryGetPayload<{ include: typeof inventoryInclude }>;
+async function hydrate(rows: InventoryDoc[]): Promise<InventoryView[]> {
+  const [products, warehouses] = await Promise.all([
+    mapByIds<ProductDoc>(cols.products, rows.map((row) => row.productId)),
+    mapByIds<WarehouseDoc>(cols.warehouses, rows.map((row) => row.warehouseId)),
+  ]);
+  return rows.flatMap((row) => {
+    const product = products.get(row.productId);
+    const warehouse = warehouses.get(row.warehouseId);
+    if (!product || !warehouse) {
+      return [];
+    }
+    return [{
+      ...row,
+      product: {
+        id: product.id,
+        sku: product.sku,
+        name: product.name,
+        unit: product.unit,
+        unitCost: product.unitCost,
+        sellingPrice: product.sellingPrice,
+        status: product.status,
+        leadTimeDays: product.leadTimeDays,
+        moq: product.moq,
+      },
+      warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name, city: warehouse.city },
+    }];
+  });
+}
 
-export function toInventory(row: InventoryWithRelations) {
+export function toInventory(row: InventoryView) {
   return {
     id: row.id,
     organizationId: row.organizationId,
@@ -76,39 +85,36 @@ export async function getInventoryHealth(
   filters: { productId?: string; warehouseId?: string } = {},
 ) {
   const since = daysAgo(DEMAND_LOOKBACK_DAYS);
-  const inventoryWhere: Prisma.InventoryWhereInput = {
+  const inventoryFilter = {
     organizationId,
     ...(filters.productId ? { productId: filters.productId } : {}),
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
   };
-
   const [rows, grouped, history, storedForecasts] = await Promise.all([
-    prisma.inventory.findMany({
-      where: inventoryWhere,
-      include: inventoryInclude,
-    }),
-    prisma.sale.groupBy({
-      by: ['productId', 'warehouseId'],
-      where: {
-        organizationId,
-        soldAt: { gte: since },
-        ...(filters.productId ? { productId: filters.productId } : {}),
-        ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+    findMany<InventoryDoc>(cols.inventory, inventoryFilter).then(hydrate),
+    aggregate<{ _id: { productId: string; warehouseId: string }; quantity: number }>(cols.sales, [
+      {
+        $match: {
+          organizationId,
+          soldAt: { $gte: since },
+          ...(filters.productId ? { productId: filters.productId } : {}),
+          ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+        },
       },
-      _sum: { quantity: true },
-    }),
+      { $group: { _id: { productId: '$productId', warehouseId: '$warehouseId' }, quantity: { $sum: '$quantity' } } },
+    ]),
     loadDailyDemand(organizationId, filters),
-    prisma.forecast.findMany({
-      where: {
+    findMany<{ productId: string; warehouseId: string; forecastDate: Date; predictedDemand: string; id: string }>(
+      cols.forecasts,
+      {
         organizationId,
-        modelVersion: { in: ['gbm-demand-v1', 'gbm-demand-v2'] },
-        forecastDate: { gte: new Date() },
+        modelVersion: { $in: ['gbm-demand-v1', 'gbm-demand-v2'] },
+        forecastDate: { $gte: new Date() },
         ...(filters.productId ? { productId: filters.productId } : {}),
         ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       },
-      select: { productId: true, warehouseId: true, forecastDate: true, predictedDemand: true },
-      orderBy: { forecastDate: 'asc' },
-    }),
+      { sort: { forecastDate: 1 } },
+    ),
   ]);
 
   const forecastByPosition = new Map<string, number[]>();
@@ -121,7 +127,7 @@ export async function getInventoryHealth(
 
   const demand = new Map<string, number>();
   for (const row of grouped) {
-    demand.set(demandKey(row.productId, row.warehouseId), row._sum.quantity ?? 0);
+    demand.set(demandKey(row._id.productId, row._id.warehouseId), row.quantity ?? 0);
   }
 
   return rows.map((row) => {
@@ -151,7 +157,6 @@ export async function getInventoryHealth(
         })
       : plan.stockoutProbability;
     const riskLevel = applyLeadTimeRisk(cover, row.product.leadTimeDays);
-
     return {
       inventoryId: row.id,
       productId: row.productId,
@@ -184,27 +189,20 @@ export async function getInventoryHealth(
 }
 
 export async function listInventory(organizationId: string, query: ListQuery) {
-  const where: Prisma.InventoryWhereInput = {
+  const filter = {
     organizationId,
     ...(query.productId ? { productId: query.productId } : {}),
     ...(query.warehouseId ? { warehouseId: query.warehouseId } : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.inventory.count({ where }),
-    prisma.inventory.findMany({
-      where,
-      include: inventoryInclude,
-      orderBy: { updatedAt: 'desc' },
+  const [total, rows] = await Promise.all([
+    countDocs(cols.inventory, filter),
+    findMany<InventoryDoc>(cols.inventory, filter, {
+      sort: { updatedAt: -1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
-    }),
+      limit: query.limit,
+    }).then(hydrate),
   ]);
-
-  return {
-    items: rows.map(toInventory),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map(toInventory), pagination: toPagination(query.page, query.limit, total) };
 }
 
 export async function listRisks(organizationId: string, query: RiskQuery) {
@@ -212,7 +210,6 @@ export async function listRisks(organizationId: string, query: RiskQuery) {
     ...(query.productId ? { productId: query.productId } : {}),
     ...(query.warehouseId ? { warehouseId: query.warehouseId } : {}),
   });
-
   const search = query.search?.toLowerCase();
   const filtered = health
     .filter((row) => (query.riskLevel ? row.riskLevel === query.riskLevel : true))
@@ -226,14 +223,11 @@ export async function listRisks(organizationId: string, query: RiskQuery) {
     )
     .sort((left, right) => {
       const rank = riskRank(left.riskLevel) - riskRank(right.riskLevel);
-      if (rank !== 0) {
-        return rank;
-      }
+      if (rank !== 0) return rank;
       const leftDays = left.daysOfInventory ?? Number.POSITIVE_INFINITY;
       const rightDays = right.daysOfInventory ?? Number.POSITIVE_INFINITY;
       return leftDays - rightDays;
     });
-
   const start = toSkip(query.page, query.limit);
   return {
     items: filtered.slice(start, start + query.limit),
@@ -242,71 +236,54 @@ export async function listRisks(organizationId: string, query: RiskQuery) {
 }
 
 export async function getInventory(organizationId: string, id: string) {
-  const row = await prisma.inventory.findFirst({
-    where: { id, organizationId },
-    include: inventoryInclude,
-  });
-  if (!row) {
-    throw notFound('Inventory not found');
-  }
-  return toInventory(row);
+  const row = await findOne<InventoryDoc>(cols.inventory, { _id: id, organizationId });
+  if (!row) throw notFound('Inventory not found');
+  const [view] = await hydrate([row]);
+  if (!view) throw notFound('Inventory not found');
+  return toInventory(view);
 }
 
 async function assertProductAndWarehouse(organizationId: string, productId: string, warehouseId: string) {
   const [product, warehouse] = await Promise.all([
-    prisma.product.findFirst({ where: { id: productId, organizationId }, select: { id: true } }),
-    prisma.warehouse.findFirst({ where: { id: warehouseId, organizationId }, select: { id: true } }),
+    findOne<ProductDoc>(cols.products, { _id: productId, organizationId }),
+    findOne<WarehouseDoc>(cols.warehouses, { _id: warehouseId, organizationId }),
   ]);
-  if (!product) {
-    throw notFound('Product not found');
-  }
-  if (!warehouse) {
-    throw notFound('Warehouse not found');
-  }
+  if (!product) throw notFound('Product not found');
+  if (!warehouse) throw notFound('Warehouse not found');
 }
 
 export async function createInventory(organizationId: string, userId: string, input: CreateBody) {
   await assertProductAndWarehouse(organizationId, input.productId, input.warehouseId);
-
-  const existing = await prisma.inventory.findFirst({
-    where: { organizationId, productId: input.productId, warehouseId: input.warehouseId },
-    select: { id: true },
+  const existing = await findOne<InventoryDoc>(cols.inventory, {
+    organizationId,
+    productId: input.productId,
+    warehouseId: input.warehouseId,
   });
   if (existing) {
-    throw conflict(
-      'INVENTORY_EXISTS',
-      'Inventory already exists for this product and warehouse',
-    );
+    throw conflict('INVENTORY_EXISTS', 'Inventory already exists for this product and warehouse');
   }
-
-  const created = await prisma.$transaction(async (tx) => {
-    const row = await tx.inventory.create({
-      data: {
-        organizationId,
-        productId: input.productId,
-        warehouseId: input.warehouseId,
-        quantity: input.quantity,
-        reservedQty: input.reservedQty ?? 0,
-        reorderPoint: input.reorderPoint ?? 0,
-      },
-      include: inventoryInclude,
+  const created = await withTransaction(async () => {
+    const row = await insertOne<InventoryDoc>(cols.inventory, {
+      organizationId,
+      productId: input.productId,
+      warehouseId: input.warehouseId,
+      quantity: input.quantity,
+      reservedQty: input.reservedQty ?? 0,
+      reorderPoint: input.reorderPoint ?? 0,
     });
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.INVENTORY_CREATED,
       entityType: 'Inventory',
       entityId: row.id,
-      metadata: {
-        productId: row.productId,
-        warehouseId: row.warehouseId,
-        quantity: row.quantity,
-      },
+      metadata: { productId: row.productId, warehouseId: row.warehouseId, quantity: row.quantity },
     });
     return row;
   });
-
-  return toInventory(created);
+  const [view] = await hydrate([created]);
+  if (!view) throw notFound('Inventory not found');
+  return toInventory(view);
 }
 
 export async function updateInventory(
@@ -316,14 +293,10 @@ export async function updateInventory(
   id: string,
   input: UpdateBody,
 ) {
-  const existing = await prisma.inventory.findFirst({ where: { id, organizationId } });
-  if (!existing) {
-    throw notFound('Inventory not found');
-  }
-
+  const existing = await findOne<InventoryDoc>(cols.inventory, { _id: id, organizationId });
+  if (!existing) throw notFound('Inventory not found');
   const nextQuantity = input.quantity ?? existing.quantity;
   const nextReserved = input.reservedQty ?? existing.reservedQty;
-
   if (nextQuantity < 0 && !input.allowNegative) {
     throw conflict('NEGATIVE_STOCK', 'Inventory cannot become negative unless explicitly allowed');
   }
@@ -333,48 +306,28 @@ export async function updateInventory(
   if (nextReserved > nextQuantity && nextQuantity >= 0) {
     throw conflict('RESERVED_EXCEEDS_STOCK', 'Reserved quantity cannot exceed on-hand quantity');
   }
-
-  const updated = await prisma.$transaction(async (tx) => {
-    const result = await tx.inventory.updateMany({
-      where: { id, organizationId },
-      data: {
-        ...(input.quantity !== undefined ? { quantity: input.quantity } : {}),
-        ...(input.reservedQty !== undefined ? { reservedQty: input.reservedQty } : {}),
-        ...(input.reorderPoint !== undefined ? { reorderPoint: input.reorderPoint } : {}),
-      },
+  const updated = await withTransaction(async () => {
+    const result = await patchMany(cols.inventory, { _id: id, organizationId }, {
+      ...(input.quantity !== undefined ? { quantity: input.quantity } : {}),
+      ...(input.reservedQty !== undefined ? { reservedQty: input.reservedQty } : {}),
+      ...(input.reorderPoint !== undefined ? { reorderPoint: input.reorderPoint } : {}),
     });
-    if (result.count === 0) {
-      throw notFound('Inventory not found');
-    }
-    const fresh = await tx.inventory.findFirst({
-      where: { id, organizationId },
-      include: inventoryInclude,
-    });
-    if (!fresh) {
-      throw notFound('Inventory not found');
-    }
-    await recordAudit(tx, {
+    if (result === 0) throw notFound('Inventory not found');
+    const fresh = await findOne<InventoryDoc>(cols.inventory, { _id: id, organizationId });
+    if (!fresh) throw notFound('Inventory not found');
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.INVENTORY_UPDATED,
       entityType: 'Inventory',
       entityId: id,
       metadata: {
-        before: {
-          quantity: existing.quantity,
-          reservedQty: existing.reservedQty,
-          reorderPoint: existing.reorderPoint,
-        },
-        after: {
-          quantity: fresh.quantity,
-          reservedQty: fresh.reservedQty,
-          reorderPoint: fresh.reorderPoint,
-        },
+        before: { quantity: existing.quantity, reservedQty: existing.reservedQty, reorderPoint: existing.reorderPoint },
+        after: { quantity: fresh.quantity, reservedQty: fresh.reservedQty, reorderPoint: fresh.reorderPoint },
       },
     });
     return fresh;
   });
-
   void publishEvent({
     name: DomainEventName.INVENTORY_UPDATED,
     organizationId,
@@ -382,6 +335,7 @@ export async function updateInventory(
     entityId: updated.id,
     payload: { quantity: updated.quantity },
   });
-
-  return toInventory(updated);
+  const [view] = await hydrate([updated]);
+  if (!view) throw notFound('Inventory not found');
+  return toInventory(view);
 }

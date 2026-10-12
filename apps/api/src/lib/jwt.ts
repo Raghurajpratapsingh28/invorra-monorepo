@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../domain/enums';
 import { JWT_EXPIRES_IN } from '../config/auth';
 import { env } from '../config/env';
 

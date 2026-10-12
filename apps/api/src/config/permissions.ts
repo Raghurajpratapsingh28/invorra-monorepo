@@ -1,4 +1,4 @@
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../domain/enums';
 
 export const resources = [
   'products',

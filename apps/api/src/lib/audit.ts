@@ -1,7 +1,6 @@
-import { Prisma, PrismaClient } from '@prisma/client';
+import { cols, insertOne } from '../db/mongo';
+import type { AuditLogDoc } from '../domain/documents';
 import { requestContext } from './request-context';
-
-type AuditClient = PrismaClient | Prisma.TransactionClient;
 
 export const AuditAction = {
   ORG_REGISTERED: 'ORG_REGISTERED',
@@ -32,27 +31,22 @@ export const AuditAction = {
   PURCHASE_ORDER_RECEIVED: 'PURCHASE_ORDER_RECEIVED',
 } as const;
 
-export async function recordAudit(
-  db: AuditClient,
-  entry: {
-    organizationId: string;
-    userId?: string | null;
-    action: string;
-    entityType: string;
-    entityId?: string | null;
-    metadata?: Prisma.InputJsonValue;
-    ipAddress?: string | null;
-  },
-): Promise<void> {
-  await db.auditLog.create({
-    data: {
-      organizationId: entry.organizationId,
-      userId: entry.userId ?? null,
-      action: entry.action,
-      entityType: entry.entityType,
-      entityId: entry.entityId ?? null,
-      metadata: entry.metadata,
-      ipAddress: entry.ipAddress ?? requestContext.getStore()?.ip ?? null,
-    },
+export async function recordAudit(entry: {
+  organizationId: string;
+  userId?: string | null;
+  action: string;
+  entityType: string;
+  entityId?: string | null;
+  metadata?: Record<string, unknown> | null;
+  ipAddress?: string | null;
+}): Promise<void> {
+  await insertOne<AuditLogDoc>(cols.auditLogs, {
+    organizationId: entry.organizationId,
+    userId: entry.userId ?? null,
+    action: entry.action,
+    entityType: entry.entityType,
+    entityId: entry.entityId ?? null,
+    metadata: entry.metadata ?? null,
+    ipAddress: entry.ipAddress ?? requestContext.getStore()?.ip ?? null,
   });
 }

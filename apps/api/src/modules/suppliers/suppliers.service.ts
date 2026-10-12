@@ -1,20 +1,27 @@
-import { Prisma, Supplier } from '@prisma/client';
 import { z } from 'zod';
+import {
+  cols,
+  contains,
+  countDocs,
+  equalsIgnoreCase,
+  findMany,
+  findOne,
+  insertOne,
+  patchMany,
+  removeMany,
+  withTransaction,
+} from '../../db/mongo';
+import type { SupplierDoc } from '../../domain/documents';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
 import { conflict, notFound } from '../../utils/errors';
 import { toPagination, toSkip } from '../../utils/pagination';
-import type {
-  createSupplierSchema,
-  listSuppliersSchema,
-  updateSupplierSchema,
-} from './suppliers.schema';
+import type { createSupplierSchema, listSuppliersSchema, updateSupplierSchema } from './suppliers.schema';
 
 type ListQuery = z.infer<typeof listSuppliersSchema>['query'];
 type CreateBody = z.infer<typeof createSupplierSchema>['body'];
 type UpdateBody = z.infer<typeof updateSupplierSchema>['body'];
 
-export function toSupplier(supplier: Supplier) {
+export function toSupplier(supplier: SupplierDoc) {
   return {
     id: supplier.id,
     organizationId: supplier.organizationId,
@@ -30,37 +37,24 @@ export function toSupplier(supplier: Supplier) {
 }
 
 export async function listSuppliers(organizationId: string, query: ListQuery) {
-  const where: Prisma.SupplierWhereInput = {
+  const filter = {
     organizationId,
-    ...(query.city ? { city: { equals: query.city, mode: 'insensitive' } } : {}),
-    ...(query.search
-      ? {
-          OR: [
-            { name: { contains: query.search, mode: 'insensitive' } },
-            { code: { contains: query.search, mode: 'insensitive' } },
-          ],
-        }
-      : {}),
+    ...(query.city ? { city: equalsIgnoreCase(query.city) } : {}),
+    ...(query.search ? { $or: [{ name: contains(query.search) }, { code: contains(query.search) }] } : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.supplier.count({ where }),
-    prisma.supplier.findMany({
-      where,
-      orderBy: { name: 'asc' },
+  const [total, rows] = await Promise.all([
+    countDocs(cols.suppliers, filter),
+    findMany<SupplierDoc>(cols.suppliers, filter, {
+      sort: { name: 1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
+      limit: query.limit,
     }),
   ]);
-
-  return {
-    items: rows.map(toSupplier),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map(toSupplier), pagination: toPagination(query.page, query.limit, total) };
 }
 
 export async function getSupplier(organizationId: string, id: string) {
-  const supplier = await prisma.supplier.findFirst({ where: { id, organizationId } });
+  const supplier = await findOne<SupplierDoc>(cols.suppliers, { _id: id, organizationId });
   if (!supplier) {
     throw notFound('Supplier not found');
   }
@@ -68,27 +62,21 @@ export async function getSupplier(organizationId: string, id: string) {
 }
 
 export async function createSupplier(organizationId: string, userId: string, input: CreateBody) {
-  const duplicate = await prisma.supplier.findFirst({
-    where: { organizationId, code: input.code },
-    select: { id: true },
-  });
+  const duplicate = await findOne<SupplierDoc>(cols.suppliers, { organizationId, code: input.code });
   if (duplicate) {
     throw conflict('SUPPLIER_CODE_CONFLICT', 'Supplier code already exists in this organization');
   }
-
-  const supplier = await prisma.$transaction(async (tx) => {
-    const created = await tx.supplier.create({
-      data: {
-        organizationId,
-        name: input.name,
-        code: input.code,
-        email: input.email ?? null,
-        phone: input.phone ?? null,
-        city: input.city ?? null,
-        leadTimeDays: input.leadTimeDays ?? 5,
-      },
+  const supplier = await withTransaction(async () => {
+    const created = await insertOne<SupplierDoc>(cols.suppliers, {
+      organizationId,
+      name: input.name,
+      code: input.code,
+      email: input.email ?? null,
+      phone: input.phone ?? null,
+      city: input.city ?? null,
+      leadTimeDays: input.leadTimeDays ?? 5,
     });
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.SUPPLIER_CREATED,
@@ -98,51 +86,41 @@ export async function createSupplier(organizationId: string, userId: string, inp
     });
     return created;
   });
-
   return toSupplier(supplier);
 }
 
-export async function updateSupplier(
-  organizationId: string,
-  userId: string,
-  id: string,
-  input: UpdateBody,
-) {
-  const existing = await prisma.supplier.findFirst({ where: { id, organizationId } });
+export async function updateSupplier(organizationId: string, userId: string, id: string, input: UpdateBody) {
+  const existing = await findOne<SupplierDoc>(cols.suppliers, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Supplier not found');
   }
-
   if (input.code && input.code !== existing.code) {
-    const duplicate = await prisma.supplier.findFirst({
-      where: { organizationId, code: input.code, NOT: { id } },
-      select: { id: true },
+    const duplicate = await findOne<SupplierDoc>(cols.suppliers, {
+      organizationId,
+      code: input.code,
+      _id: { $ne: id },
     });
     if (duplicate) {
       throw conflict('SUPPLIER_CODE_CONFLICT', 'Supplier code already exists in this organization');
     }
   }
-
-  const supplier = await prisma.$transaction(async (tx) => {
-    const updated = await tx.supplier.updateMany({
-      where: { id, organizationId },
-      data: {
-        ...(input.name !== undefined ? { name: input.name } : {}),
-        ...(input.code !== undefined ? { code: input.code } : {}),
-        ...(input.email !== undefined ? { email: input.email } : {}),
-        ...(input.phone !== undefined ? { phone: input.phone } : {}),
-        ...(input.city !== undefined ? { city: input.city } : {}),
-        ...(input.leadTimeDays !== undefined ? { leadTimeDays: input.leadTimeDays } : {}),
-      },
+  const supplier = await withTransaction(async () => {
+    const updated = await patchMany(cols.suppliers, { _id: id, organizationId }, {
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.code !== undefined ? { code: input.code } : {}),
+      ...(input.email !== undefined ? { email: input.email } : {}),
+      ...(input.phone !== undefined ? { phone: input.phone } : {}),
+      ...(input.city !== undefined ? { city: input.city } : {}),
+      ...(input.leadTimeDays !== undefined ? { leadTimeDays: input.leadTimeDays } : {}),
     });
-    if (updated.count === 0) {
+    if (updated === 0) {
       throw notFound('Supplier not found');
     }
-    const fresh = await tx.supplier.findFirst({ where: { id, organizationId } });
+    const fresh = await findOne<SupplierDoc>(cols.suppliers, { _id: id, organizationId });
     if (!fresh) {
       throw notFound('Supplier not found');
     }
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.SUPPLIER_UPDATED,
@@ -152,29 +130,24 @@ export async function updateSupplier(
     });
     return fresh;
   });
-
   return toSupplier(supplier);
 }
 
 export async function deleteSupplier(organizationId: string, userId: string, id: string) {
-  const existing = await prisma.supplier.findFirst({ where: { id, organizationId } });
+  const existing = await findOne<SupplierDoc>(cols.suppliers, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Supplier not found');
   }
-
-  const purchaseOrders = await prisma.purchaseOrder.count({
-    where: { organizationId, supplierId: id },
-  });
+  const purchaseOrders = await countDocs(cols.purchaseOrders, { organizationId, supplierId: id });
   if (purchaseOrders > 0) {
     throw conflict('SUPPLIER_IN_USE', 'Cannot delete a supplier that has purchase orders.');
   }
-
-  await prisma.$transaction(async (tx) => {
-    const deleted = await tx.supplier.deleteMany({ where: { id, organizationId } });
-    if (deleted.count === 0) {
+  await withTransaction(async () => {
+    const deleted = await removeMany(cols.suppliers, { _id: id, organizationId });
+    if (deleted === 0) {
       throw notFound('Supplier not found');
     }
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.SUPPLIER_DELETED,
@@ -183,6 +156,5 @@ export async function deleteSupplier(organizationId: string, userId: string, id:
       metadata: { code: existing.code },
     });
   });
-
   return { id, deleted: true as const };
 }

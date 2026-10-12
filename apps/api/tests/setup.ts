@@ -1,17 +1,15 @@
 import { afterAll, beforeAll } from 'vitest';
-import { prisma } from '../src/lib/prisma';
+import { cols, disconnectMongo, findMany } from '../src/db/mongo';
+import type { OrganizationDoc } from '../src/domain/documents';
 import { deleteTenant } from '../src/lib/tenant-cleanup';
 
 beforeAll(async () => {
-  const organizations = await prisma.organization.findMany({
-    where: { slug: { startsWith: 'test-' } },
-    select: { id: true },
-  });
+  const organizations = await findMany<OrganizationDoc>(cols.organizations, { slug: { $regex: '^test-' } });
   for (const organization of organizations) {
     await deleteTenant(organization.id);
   }
 });
 
 afterAll(async () => {
-  await prisma.$disconnect();
+  await disconnectMongo();
 });

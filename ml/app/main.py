@@ -1,17 +1,6 @@
 """Per-series demand model for Invorra.
 
-Each product-warehouse history is trained separately. The production model is an
-fixed-weight ensemble of two histogram gradient boosters: one on raw demand and
-one on log demand, so spikes do not dominate weekday patterns. Features cover
-lags, rolling level and spread, same-weekday lags, calendar cycles, and a
-stockout flag when a day is zero after recent sales.
-
-Accuracy is measured on the last 7 days before the ensemble is refit for the
-forward forecast. Intervals use the holdout residual spread. Forward days are
-damped toward the recent level so recursive error does not run away.
-
-This is not a global model trained on other tenants, and it does not use price
-or promotions.
+Each product-warehouse history is trained separately. 
 """
 
 from __future__ import annotations

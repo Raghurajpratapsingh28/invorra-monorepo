@@ -1,4 +1,4 @@
-import { RiskLevel } from '@prisma/client';
+import { RiskLevel } from '../../domain/enums';
 import { z } from 'zod';
 import { idSchema, nonNegativeIntSchema, paginationFields } from '../../utils/zod';
 

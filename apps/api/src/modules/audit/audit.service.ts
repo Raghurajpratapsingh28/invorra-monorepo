@@ -1,6 +1,6 @@
-import { Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { prisma } from '../../lib/prisma';
+import { cols, countDocs, findMany, mapByIds } from '../../db/mongo';
+import type { AuditLogDoc, UserDoc } from '../../domain/documents';
 import { toPagination, toSkip } from '../../utils/pagination';
 import type { listAuditSchema } from './audit.schema';
 
@@ -18,39 +18,40 @@ const actionAliases: Record<string, string> = {
 
 export async function listAuditLogs(organizationId: string, query: ListQuery) {
   const action = query.action ? actionAliases[query.action] ?? query.action : undefined;
-  const where: Prisma.AuditLogWhereInput = {
+  const filter = {
     organizationId,
     ...(action ? { action } : {}),
     ...(query.entityType ? { entityType: query.entityType } : {}),
     ...(query.entityId ? { entityId: query.entityId } : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.auditLog.count({ where }),
-    prisma.auditLog.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
+  const [total, rows] = await Promise.all([
+    countDocs(cols.auditLogs, filter),
+    findMany<AuditLogDoc>(cols.auditLogs, filter, {
+      sort: { createdAt: -1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
-      include: {
-        user: { select: { id: true, name: true, email: true, role: true } },
-      },
+      limit: query.limit,
     }),
   ]);
-
+  const users = await mapByIds<UserDoc>(
+    cols.users,
+    rows.map((row) => row.userId).filter((id): id is string => Boolean(id)),
+  );
   return {
-    items: rows.map((row) => ({
-      id: row.id,
-      organizationId: row.organizationId,
-      userId: row.userId,
-      user: row.user,
-      action: row.action,
-      entityType: row.entityType,
-      entityId: row.entityId,
-      metadata: row.metadata,
-      ipAddress: row.ipAddress,
-      createdAt: row.createdAt,
-    })),
+    items: rows.map((row) => {
+      const user = row.userId ? users.get(row.userId) : undefined;
+      return {
+        id: row.id,
+        organizationId: row.organizationId,
+        userId: row.userId,
+        user: user ? { id: user.id, name: user.name, email: user.email, role: user.role } : null,
+        action: row.action,
+        entityType: row.entityType,
+        entityId: row.entityId,
+        metadata: row.metadata,
+        ipAddress: row.ipAddress,
+        createdAt: row.createdAt,
+      };
+    }),
     pagination: toPagination(query.page, query.limit, total),
   };
 }

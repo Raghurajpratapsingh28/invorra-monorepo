@@ -8,11 +8,11 @@ dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
-  DATABASE_URL: z
+  MONGODB_URI: z
     .string()
     .min(1)
-    .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
-      message: 'DATABASE_URL must be a PostgreSQL connection string',
+    .refine((value) => value.startsWith('mongodb://') || value.startsWith('mongodb+srv://'), {
+      message: 'MONGODB_URI must be a MongoDB connection string',
     }),
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   CORS_ORIGIN: z.string().url(),

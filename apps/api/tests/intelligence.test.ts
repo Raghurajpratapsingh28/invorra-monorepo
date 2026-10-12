@@ -1,4 +1,4 @@
-import { RiskLevel } from '@prisma/client';
+import { RiskLevel } from '../src/domain/enums';
 import { afterAll, expect, it } from 'vitest';
 import { FORECAST_WEIGHTS, SERVICE_LEVEL_Z } from '../src/config/business';
 import {

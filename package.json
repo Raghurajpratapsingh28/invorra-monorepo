@@ -15,19 +15,10 @@
     "test": "npm run test -w @invorra/api && npm run test -w @invorra/web",
     "lint": "npm run lint -w @invorra/api",
     "format": "prettier --write .",
-    "db:generate": "prisma generate --schema prisma/schema.prisma",
-    "db:migrate": "prisma migrate dev --schema prisma/schema.prisma",
-    "db:deploy": "prisma migrate deploy --schema prisma/schema.prisma",
-    "db:seed": "prisma db seed",
-    "seed": "prisma db seed",
-    "db:studio": "prisma studio --schema prisma/schema.prisma",
-    "postinstall": "prisma generate --schema prisma/schema.prisma"
-  },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx scripts/seed.ts",
+    "seed": "tsx scripts/seed.ts"
   },
   "dependencies": {
-    "@prisma/client": "^6.16.2",
     "bcrypt": "^6.0.0",
     "dotenv": "^16.6.1"
   },
@@ -35,7 +26,6 @@
     "@types/bcrypt": "^6.0.0",
     "@types/node": "^22.18.6",
     "prettier": "^3.6.2",
-    "prisma": "^6.16.2",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   },

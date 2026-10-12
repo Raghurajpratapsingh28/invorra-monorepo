@@ -42,25 +42,24 @@ An assistant can answer "what should I order today?" by calling the same APIs. I
 ```mermaid
 flowchart LR
   web[React / Vite] --> api[Express API]
-  api --> prisma[Prisma]
-  prisma --> postgres[(PostgreSQL)]
+  api --> mongo[(MongoDB)]
   api --> events[Event publisher]
   events --> nats[NATS JetStream optional]
   api --> ml[Python forecast service optional]
 ```
 
-Local development runs the API and web on the host. `docker compose up -d` starts PostgreSQL and NATS. The full stack is `docker compose --profile full up --build`.
+Local development runs the API and web on the host. `docker compose up -d` starts MongoDB (a single-node replica set, so multi-document transactions work) and NATS. The full stack is `docker compose --profile full up --build`.
 
 ## Tech stack
 
 - React, TypeScript, Vite, Tailwind, Recharts
-- Node.js, Express, Zod, Prisma
-- PostgreSQL
+- Node.js, Express, Zod, MongoDB driver
+- MongoDB
 - Optional: FastAPI, NumPy, scikit-learn, NATS JetStream
 
 ## Database design
 
-Tenant-owned tables carry `organizationId`. Product SKU, warehouse code, and supplier code are unique per organization. Inventory is unique per product and warehouse. Monetary values are decimals. Sales, forecasts, recommendations, purchase orders, and audit logs are indexed by organization and the fields used in list filters.
+Tenant-owned documents carry `organizationId`. Product SKU, warehouse code, and supplier code are unique per organization. Inventory is unique per product and warehouse. Purchase-order line items are embedded on the order. Monetary values are decimal strings. Sales, forecasts, recommendations, purchase orders, and audit logs are indexed by organization and the fields used in list filters. Indexes are created when the API connects.
 
 `available stock = quantity − reserved quantity`. Sales decrement on-hand stock inside a transaction and refuse to go negative unless an owner or admin sets `allowNegative`.
 
@@ -104,10 +103,10 @@ Missing days count as zero. Confidence is half coverage (days with sales in the 
 - Zod validation and pagination caps
 - RBAC on every module
 - `organizationId` comes from the session, not the body or query
-- Updates use `updateMany` scoped by organization id
+- Updates are scoped by organization id
 - Rate limit outside tests
 - Stack traces only in development
-- Prisma parameterizes queries, including raw SQL
+- Queries are sent as structured MongoDB filters and aggregations
 
 ## Multi-tenancy
 
@@ -127,8 +126,6 @@ With `NATS_URL` unset, events are structured logs. With it set, the publisher se
 cp .env.example .env
 docker compose up -d
 npm install
-npx prisma generate
-npx prisma migrate dev
 npm run seed
 npm run dev
 npm run dev:web
@@ -150,7 +147,7 @@ docker compose up -d
 docker compose --profile full up --build
 ```
 
-The default compose file starts PostgreSQL and NATS. The `full` profile also builds the API, web, and forecast service. Set `JWT_SECRET` before using that profile. Do not commit real secrets.
+The default compose file starts MongoDB and NATS. The `full` profile also builds the API, web, and forecast service. Set `JWT_SECRET` before using that profile. Do not commit real secrets.
 
 ## Testing
 
@@ -188,7 +185,7 @@ Capture these after `npm run seed` and signing in as the owner:
 
 | Name | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | PostgreSQL |
+| `MONGODB_URI` | yes | MongoDB connection string. Local Docker uses a replica set named `rs0` |
 | `JWT_SECRET` | yes | At least 32 characters |
 | `PORT` | no | API port, default 4000 |
 | `NODE_ENV` | no | development, test, or production |

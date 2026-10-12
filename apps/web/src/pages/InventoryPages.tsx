@@ -9,7 +9,7 @@ import {
   Pagination,
   SecondaryButton,
   StatusBadge,
-  inputClass,
+  controlClass,
   panelClass,
 } from '../components/ui';
 import { daysLabel, percent, units } from '../lib/format';
@@ -66,27 +66,27 @@ export function InventoryPage() {
         subtitle="Cover, daily demand, and stockout probability for every product and warehouse."
       />
       <form
-        className="mb-4 flex flex-wrap gap-3"
+        className="mb-4 flex flex-wrap items-center gap-2"
         onSubmit={(event) => {
           event.preventDefault();
           setPageNumber(1);
           load(1);
         }}
       >
-        <input className={`${inputClass} max-w-xs`} placeholder="Search SKU, product, city" value={search} onChange={(event) => setSearch(event.target.value)} />
-        <select className={inputClass} value={riskLevel} onChange={(event) => setRiskLevel(event.target.value)}>
+        <input className={`${controlClass} w-full sm:w-64`} placeholder="Search SKU, product, city" value={search} onChange={(event) => setSearch(event.target.value)} />
+        <select className={`${controlClass} w-full sm:w-40`} value={riskLevel} onChange={(event) => setRiskLevel(event.target.value)}>
           <option value="">All risk</option>
           {['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].map((level) => (
             <option key={level} value={level}>{level}</option>
           ))}
         </select>
-        <select className={inputClass} value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}>
+        <select className={`${controlClass} w-full sm:w-56`} value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}>
           <option value="">All warehouses</option>
           {warehouses.map((warehouse) => (
             <option key={warehouse.id} value={warehouse.id}>{warehouse.name}</option>
           ))}
         </select>
-        <button type="submit" className="rounded-lg border border-line bg-white px-4 py-2 text-sm font-semibold text-ink shadow-sm transition hover:bg-mist">Search</button>
+        <SecondaryButton type="submit">Search</SecondaryButton>
       </form>
       {loading ? <LoadingState /> : null}
       {error ? <ErrorState message={error} onRetry={() => load(pageNumber)} /> : null}

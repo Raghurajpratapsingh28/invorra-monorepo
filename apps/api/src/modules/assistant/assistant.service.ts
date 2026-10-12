@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto';
 import { env } from '../../config/env';
+import { cols, findOne, mapByIds } from '../../db/mongo';
+import type { InventoryDoc, ProductDoc, RecommendationDoc, WarehouseDoc } from '../../domain/documents';
 import { logger } from '../../lib/logger';
-import { prisma } from '../../lib/prisma';
 import { getInventoryHealth } from '../inventory/inventory.service';
 import { approveRecommendation } from '../replenishment/replenishment.service';
 import {
@@ -267,18 +268,22 @@ export async function confirmAction(
 
 export async function explainTarget(organizationId: string, target: 'recommendation' | 'inventory', id: string) {
   if (target === 'recommendation') {
-    const row = await prisma.replenishmentRecommendation.findFirst({
-      where: { id, organizationId },
-      include: { product: { select: { sku: true, name: true } }, warehouse: { select: { city: true, name: true } } },
-    });
+    const row = await findOne<RecommendationDoc>(cols.recommendations, { _id: id, organizationId });
     if (!row) {
       return null;
     }
+    const products = await mapByIds<ProductDoc>(cols.products, [row.productId]);
+    const warehouses = await mapByIds<WarehouseDoc>(cols.warehouses, [row.warehouseId]);
+    const product = products.get(row.productId);
+    const warehouse = warehouses.get(row.warehouseId);
+    if (!product || !warehouse) {
+      return null;
+    }
     const facts = {
-      sku: row.product.sku,
-      productName: row.product.name,
-      warehouse: row.warehouse.name,
-      city: row.warehouse.city,
+      sku: product.sku,
+      productName: product.name,
+      warehouse: warehouse.name,
+      city: warehouse.city,
       currentStock: row.currentStock,
       forecastDemand: Number(row.forecastDemand),
       safetyStock: row.safetyStock,
@@ -297,10 +302,7 @@ export async function explainTarget(organizationId: string, target: 'recommendat
     };
   }
 
-  const inventory = await prisma.inventory.findFirst({
-    where: { id, organizationId },
-    select: { productId: true, warehouseId: true },
-  });
+  const inventory = await findOne<InventoryDoc>(cols.inventory, { _id: id, organizationId });
   if (!inventory) {
     return null;
   }

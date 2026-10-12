@@ -12,3 +12,5 @@ apps/web/dist
 .idea
 .vscode
 *.tsbuildinfo
+
+apps/api/tests/.mongo-uri

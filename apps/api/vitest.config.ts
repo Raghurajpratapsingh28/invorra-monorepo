@@ -5,8 +5,9 @@ export default defineConfig({
     environment: 'node',
     fileParallelism: false,
     maxWorkers: 1,
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
-    setupFiles: ['./tests/setup.ts'],
+    testTimeout: 60_000,
+    hookTimeout: 180_000,
+    globalSetup: ['./tests/global-setup.ts'],
+    setupFiles: ['./tests/mongo-env.ts', './tests/setup.ts'],
   },
 });

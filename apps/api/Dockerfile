@@ -2,10 +2,10 @@ FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY apps/api/package.json apps/api/package.json
-COPY prisma prisma
+COPY apps/web/package.json apps/web/package.json
 RUN npm ci
 COPY apps/api apps/api
-RUN npx prisma generate --schema prisma/schema.prisma && npm run build -w @invorra/api
+RUN npm run build -w @invorra/api
 
 FROM node:22-alpine
 WORKDIR /app

@@ -1,4 +1,4 @@
-import { RiskLevel } from '@prisma/client';
+import { RiskLevel } from '../domain/enums';
 import { RISK_THRESHOLDS } from '../config/business';
 
 export function roundTo(value: number, places: number): number {

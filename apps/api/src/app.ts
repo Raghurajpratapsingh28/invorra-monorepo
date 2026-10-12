@@ -9,7 +9,7 @@ import helmet from 'helmet';
 import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { logger } from './lib/logger';
-import { prisma } from './lib/prisma';
+import { pingMongo } from './db/mongo';
 import { requestContext } from './lib/request-context';
 import { errorHandler, notFoundHandler } from './middleware/error-handler';
 import { apiRouter } from './routes';
@@ -92,7 +92,7 @@ app.get(
   '/ready',
   asyncHandler(async (_req, res) => {
     try {
-      await prisma.$queryRaw`SELECT 1`;
+      await pingMongo();
     } catch {
       throw new AppError(503, 'DATABASE_UNAVAILABLE', 'Database is unreachable');
     }

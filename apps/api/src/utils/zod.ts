@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { z, ZodError, type ZodTypeAny } from 'zod';
 import { AppError } from './errors';
 
-export const idSchema = z.string().cuid();
+export const idSchema = z.string().uuid();
 
 export const paginationFields = {
   page: z.coerce.number().int().positive().max(100_000).default(1),

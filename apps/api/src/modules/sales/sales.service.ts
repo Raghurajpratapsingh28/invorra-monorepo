@@ -1,10 +1,11 @@
-import { Prisma, Sale, UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { can } from '../../config/permissions';
+import { cols, countDocs, findMany, findOne, insertOne, patchOne, withTransaction } from '../../db/mongo';
+import type { InventoryDoc, ProductDoc, SaleDoc, WarehouseDoc } from '../../domain/documents';
+import type { UserRole } from '../../domain/enums';
 import { publishEvent } from '../../events/publisher';
 import { DomainEventName } from '../../events/types';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
 import { AppError, conflict, forbidden, notFound } from '../../utils/errors';
 import { decimalToString, toDecimal } from '../../utils/money';
 import { toPagination, toSkip } from '../../utils/pagination';
@@ -13,7 +14,7 @@ import type { createSaleSchema, listSalesSchema } from './sales.schema';
 type ListQuery = z.infer<typeof listSalesSchema>['query'];
 type CreateBody = z.infer<typeof createSaleSchema>['body'];
 
-export function toSale(sale: Sale, remainingQuantity?: number) {
+export function toSale(sale: SaleDoc, remainingQuantity?: number) {
   return {
     id: sale.id,
     organizationId: sale.organizationId,
@@ -32,7 +33,7 @@ export function toSale(sale: Sale, remainingQuantity?: number) {
 }
 
 export async function listSales(organizationId: string, query: ListQuery) {
-  const where: Prisma.SaleWhereInput = {
+  const filter = {
     organizationId,
     ...(query.productId ? { productId: query.productId } : {}),
     ...(query.warehouseId ? { warehouseId: query.warehouseId } : {}),
@@ -40,106 +41,78 @@ export async function listSales(organizationId: string, query: ListQuery) {
     ...(query.from || query.to
       ? {
           soldAt: {
-            ...(query.from ? { gte: query.from } : {}),
-            ...(query.to ? { lte: query.to } : {}),
+            ...(query.from ? { $gte: query.from } : {}),
+            ...(query.to ? { $lte: query.to } : {}),
           },
         }
       : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.sale.count({ where }),
-    prisma.sale.findMany({
-      where,
-      orderBy: { soldAt: 'desc' },
+  const [total, rows] = await Promise.all([
+    countDocs(cols.sales, filter),
+    findMany<SaleDoc>(cols.sales, filter, {
+      sort: { soldAt: -1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
+      limit: query.limit,
     }),
   ]);
-
-  return {
-    items: rows.map((row) => toSale(row)),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map((row) => toSale(row)), pagination: toPagination(query.page, query.limit, total) };
 }
 
-export async function recordSale(
-  organizationId: string,
-  userId: string,
-  role: UserRole,
-  input: CreateBody,
-) {
+export async function recordSale(organizationId: string, userId: string, role: UserRole, input: CreateBody) {
   if (input.allowNegative && !can(role, 'sales', 'approve')) {
     throw forbidden('Only owners and admins can record sales that drive inventory negative');
   }
 
-  const sale = await prisma.$transaction(async (tx) => {
-    const product = await tx.product.findFirst({
-      where: { id: input.productId, organizationId },
-    });
+  const sale = await withTransaction(async () => {
+    const product = await findOne<ProductDoc>(cols.products, { _id: input.productId, organizationId });
     if (!product) {
       throw notFound('Product not found');
     }
     if (product.status !== 'ACTIVE') {
       throw conflict('PRODUCT_INACTIVE', 'Cannot record a sale for an inactive product');
     }
-
-    const warehouse = await tx.warehouse.findFirst({
-      where: { id: input.warehouseId, organizationId },
-      select: { id: true },
-    });
+    const warehouse = await findOne<WarehouseDoc>(cols.warehouses, { _id: input.warehouseId, organizationId });
     if (!warehouse) {
       throw notFound('Warehouse not found');
     }
-
-    const inventory = await tx.inventory.findFirst({
-      where: {
-        organizationId,
-        productId: input.productId,
-        warehouseId: input.warehouseId,
-      },
+    const inventory = await findOne<InventoryDoc>(cols.inventory, {
+      organizationId,
+      productId: input.productId,
+      warehouseId: input.warehouseId,
     });
     if (!inventory) {
       throw notFound('Inventory not found for this product and warehouse');
     }
 
-    const where: Prisma.InventoryWhereInput = {
-      id: inventory.id,
-      organizationId,
-      ...(input.allowNegative ? {} : { quantity: { gte: input.quantity } }),
-    };
-
-    const updated = await tx.inventory.updateMany({
-      where,
-      data: { quantity: { decrement: input.quantity } },
-    });
-
-    if (updated.count === 0) {
+    const updated = await patchOne(
+      cols.inventory,
+      {
+        _id: inventory.id,
+        organizationId,
+        ...(input.allowNegative ? {} : { quantity: { $gte: input.quantity } }),
+      },
+      {},
+      { $inc: { quantity: -input.quantity } },
+    );
+    if (updated === 0) {
       throw conflict('INSUFFICIENT_STOCK', 'Not enough inventory to record this sale');
     }
 
     const unitPrice = input.unitPrice ?? decimalToString(product.sellingPrice);
-    const totalAmount = toDecimal(unitPrice).mul(input.quantity);
-    const created = await tx.sale.create({
-      data: {
-        organizationId,
-        productId: input.productId,
-        warehouseId: input.warehouseId,
-        recordedById: userId,
-        quantity: input.quantity,
-        unitPrice,
-        totalAmount,
-        channel: input.channel ?? 'quick-commerce',
-        soldAt: input.soldAt ?? new Date(),
-      },
+    const totalAmount = toDecimal(unitPrice).mul(input.quantity).toFixed(2);
+    const created = await insertOne<SaleDoc>(cols.sales, {
+      organizationId,
+      productId: input.productId,
+      warehouseId: input.warehouseId,
+      recordedById: userId,
+      quantity: input.quantity,
+      unitPrice,
+      totalAmount,
+      channel: input.channel ?? 'quick-commerce',
+      soldAt: input.soldAt ?? new Date(),
     });
-
-    const fresh = await tx.inventory.findFirst({
-      where: { id: inventory.id, organizationId },
-      select: { quantity: true },
-    });
-
-    await recordAudit(tx, {
+    const fresh = await findOne<InventoryDoc>(cols.inventory, { _id: inventory.id, organizationId });
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.SALE_RECORDED,
@@ -154,7 +127,6 @@ export async function recordSale(
         allowNegative: Boolean(input.allowNegative),
       },
     });
-
     return toSale(created, fresh?.quantity);
   });
 
@@ -165,7 +137,6 @@ export async function recordSale(
     entityId: sale.id,
     payload: { quantity: sale.quantity, productId: sale.productId, warehouseId: sale.warehouseId },
   });
-
   return sale;
 }
 
@@ -193,12 +164,7 @@ function splitCsvLine(line: string): string[] {
   return cells;
 }
 
-export async function importSales(
-  organizationId: string,
-  userId: string,
-  role: UserRole,
-  csv: string,
-) {
+export async function importSales(organizationId: string, userId: string, role: UserRole, csv: string) {
   const lines = csv
     .replace(/^\uFEFF/, '')
     .split(/\r?\n/)
@@ -219,8 +185,8 @@ export async function importSales(
   }
 
   const [products, warehouses] = await Promise.all([
-    prisma.product.findMany({ where: { organizationId }, select: { id: true, sku: true, sellingPrice: true, status: true } }),
-    prisma.warehouse.findMany({ where: { organizationId }, select: { id: true, code: true } }),
+    findMany<ProductDoc>(cols.products, { organizationId }),
+    findMany<WarehouseDoc>(cols.warehouses, { organizationId }),
   ]);
   const productBySku = new Map(products.map((product) => [product.sku.toLowerCase(), product]));
   const warehouseByCode = new Map(warehouses.map((warehouse) => [warehouse.code.toLowerCase(), warehouse]));
@@ -259,6 +225,5 @@ export async function importSales(
       });
     }
   }
-
   return { created, failed: errors.length, errors: errors.slice(0, 20) };
 }

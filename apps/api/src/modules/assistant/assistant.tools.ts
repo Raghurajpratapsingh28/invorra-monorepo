@@ -1,7 +1,8 @@
-import { PurchaseOrderStatus } from '@prisma/client';
+import { cols, contains, findMany, mapByIds } from '../../db/mongo';
+import type { ProductDoc, PurchaseOrderDoc, RecommendationDoc, SupplierDoc, WarehouseDoc } from '../../domain/documents';
+import type { PurchaseOrderStatus } from '../../domain/enums';
 import { getDashboardSummary } from '../dashboard/dashboard.service';
 import { getInventoryHealth } from '../inventory/inventory.service';
-import { prisma } from '../../lib/prisma';
 
 export async function getInventoryRisks(organizationId: string) {
   const rows = await getInventoryHealth(organizationId);
@@ -27,23 +28,26 @@ export async function getInventoryRisks(organizationId: string) {
 }
 
 export async function getReplenishmentRecommendations(organizationId: string) {
-  const rows = await prisma.replenishmentRecommendation.findMany({
-    where: { organizationId, status: 'PENDING' },
-    include: {
-      product: { select: { sku: true, name: true } },
-      warehouse: { select: { name: true, city: true } },
-      supplier: { select: { name: true } },
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 25,
-  });
+  const rows = await findMany<RecommendationDoc>(
+    cols.recommendations,
+    { organizationId, status: 'PENDING' },
+    { sort: { createdAt: -1 }, limit: 25 },
+  );
+  const [products, warehouses, suppliers] = await Promise.all([
+    mapByIds<ProductDoc>(cols.products, rows.map((row) => row.productId)),
+    mapByIds<WarehouseDoc>(cols.warehouses, rows.map((row) => row.warehouseId)),
+    mapByIds<SupplierDoc>(
+      cols.suppliers,
+      rows.map((row) => row.supplierId).filter((id): id is string => Boolean(id)),
+    ),
+  ]);
   return rows.map((row) => ({
     id: row.id,
-    sku: row.product.sku,
-    productName: row.product.name,
-    warehouse: row.warehouse.name,
-    city: row.warehouse.city,
-    supplier: row.supplier?.name ?? null,
+    sku: products.get(row.productId)?.sku ?? '',
+    productName: products.get(row.productId)?.name ?? '',
+    warehouse: warehouses.get(row.warehouseId)?.name ?? '',
+    city: warehouses.get(row.warehouseId)?.city ?? '',
+    supplier: row.supplierId ? suppliers.get(row.supplierId)?.name ?? null : null,
     currentStock: row.currentStock,
     forecastDemand: Number(row.forecastDemand),
     safetyStock: row.safetyStock,
@@ -59,22 +63,21 @@ export async function getReplenishmentRecommendations(organizationId: string) {
 }
 
 export async function getPurchaseOrders(organizationId: string, status?: PurchaseOrderStatus) {
-  const rows = await prisma.purchaseOrder.findMany({
-    where: { organizationId, ...(status ? { status } : {}) },
-    include: {
-      supplier: { select: { name: true } },
-      warehouse: { select: { city: true } },
-      items: { select: { quantity: true, unitCost: true } },
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 20,
-  });
+  const rows = await findMany<PurchaseOrderDoc>(
+    cols.purchaseOrders,
+    { organizationId, ...(status ? { status } : {}) },
+    { sort: { createdAt: -1 }, limit: 20 },
+  );
+  const [suppliers, warehouses] = await Promise.all([
+    mapByIds<SupplierDoc>(cols.suppliers, rows.map((row) => row.supplierId)),
+    mapByIds<WarehouseDoc>(cols.warehouses, rows.map((row) => row.warehouseId)),
+  ]);
   return rows.map((row) => ({
     id: row.id,
     poNumber: row.poNumber,
     status: row.status,
-    supplier: row.supplier.name,
-    city: row.warehouse.city,
+    supplier: suppliers.get(row.supplierId)?.name ?? '',
+    city: warehouses.get(row.warehouseId)?.city ?? '',
     lines: row.items.length,
     quantity: row.items.reduce((sum, item) => sum + item.quantity, 0),
   }));
@@ -95,22 +98,25 @@ export async function getDashboard(organizationId: string) {
 }
 
 export async function getProductByName(organizationId: string, query: string) {
-  return prisma.product.findMany({
-    where: {
+  const rows = await findMany<ProductDoc>(
+    cols.products,
+    {
       organizationId,
-      OR: [
-        { name: { contains: query, mode: 'insensitive' } },
-        { sku: { contains: query, mode: 'insensitive' } },
-      ],
+      $or: [{ name: contains(query) }, { sku: contains(query) }],
     },
-    select: { id: true, sku: true, name: true, leadTimeDays: true, moq: true, status: true },
-    take: 5,
-  });
+    { limit: 5 },
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    sku: row.sku,
+    name: row.name,
+    leadTimeDays: row.leadTimeDays,
+    moq: row.moq,
+    status: row.status,
+  }));
 }
 
-export function mostCriticalWarehouse(
-  risks: Awaited<ReturnType<typeof getInventoryRisks>>,
-) {
+export function mostCriticalWarehouse(risks: Awaited<ReturnType<typeof getInventoryRisks>>) {
   const counts = new Map<string, { warehouse: string; city: string; critical: number; high: number }>();
   for (const row of risks) {
     const current = counts.get(row.warehouse) ?? {
@@ -119,12 +125,8 @@ export function mostCriticalWarehouse(
       critical: 0,
       high: 0,
     };
-    if (row.riskLevel === 'CRITICAL') {
-      current.critical += 1;
-    }
-    if (row.riskLevel === 'HIGH') {
-      current.high += 1;
-    }
+    if (row.riskLevel === 'CRITICAL') current.critical += 1;
+    if (row.riskLevel === 'HIGH') current.high += 1;
     counts.set(row.warehouse, current);
   }
   return [...counts.values()].sort((left, right) => right.critical - left.critical || right.high - left.high);

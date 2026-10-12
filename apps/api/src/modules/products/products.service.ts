@@ -1,17 +1,17 @@
-import { Prisma, Product } from '@prisma/client';
+import type { z } from 'zod';
+import { cols, contains, countDocs, findMany, findOne, insertOne, patchMany, removeMany, withTransaction } from '../../db/mongo';
+import type { ProductDoc } from '../../domain/documents';
 import { AuditAction, recordAudit } from '../../lib/audit';
-import { prisma } from '../../lib/prisma';
+import { conflict, notFound } from '../../utils/errors';
 import { decimalToString } from '../../utils/money';
 import { toPagination, toSkip } from '../../utils/pagination';
-import { conflict, notFound } from '../../utils/errors';
-import type { z } from 'zod';
 import type { createProductSchema, listProductsSchema, updateProductSchema } from './products.schema';
 
 type ListQuery = z.infer<typeof listProductsSchema>['query'];
 type CreateBody = z.infer<typeof createProductSchema>['body'];
 type UpdateBody = z.infer<typeof updateProductSchema>['body'];
 
-export function toProduct(product: Product) {
+export function toProduct(product: ProductDoc) {
   return {
     id: product.id,
     organizationId: product.organizationId,
@@ -33,38 +33,25 @@ export function toProduct(product: Product) {
 }
 
 export async function listProducts(organizationId: string, query: ListQuery) {
-  const where: Prisma.ProductWhereInput = {
+  const filter = {
     organizationId,
     ...(query.status ? { status: query.status } : {}),
     ...(query.category ? { category: query.category } : {}),
-    ...(query.search
-      ? {
-          OR: [
-            { name: { contains: query.search, mode: 'insensitive' } },
-            { sku: { contains: query.search, mode: 'insensitive' } },
-          ],
-        }
-      : {}),
+    ...(query.search ? { $or: [{ name: contains(query.search) }, { sku: contains(query.search) }] } : {}),
   };
-
-  const [total, rows] = await prisma.$transaction([
-    prisma.product.count({ where }),
-    prisma.product.findMany({
-      where,
-      orderBy: [{ name: 'asc' }],
+  const [total, rows] = await Promise.all([
+    countDocs(cols.products, filter),
+    findMany<ProductDoc>(cols.products, filter, {
+      sort: { name: 1 },
       skip: toSkip(query.page, query.limit),
-      take: query.limit,
+      limit: query.limit,
     }),
   ]);
-
-  return {
-    items: rows.map(toProduct),
-    pagination: toPagination(query.page, query.limit, total),
-  };
+  return { items: rows.map(toProduct), pagination: toPagination(query.page, query.limit, total) };
 }
 
 export async function getProduct(organizationId: string, id: string) {
-  const product = await prisma.product.findFirst({ where: { id, organizationId } });
+  const product = await findOne<ProductDoc>(cols.products, { _id: id, organizationId });
   if (!product) {
     throw notFound('Product not found');
   }
@@ -72,34 +59,28 @@ export async function getProduct(organizationId: string, id: string) {
 }
 
 export async function createProduct(organizationId: string, userId: string, input: CreateBody) {
-  const duplicate = await prisma.product.findFirst({
-    where: { organizationId, sku: input.sku },
-    select: { id: true },
-  });
+  const duplicate = await findOne<ProductDoc>(cols.products, { organizationId, sku: input.sku });
   if (duplicate) {
     throw conflict('SKU_CONFLICT', 'SKU already exists in this organization');
   }
 
-  const product = await prisma.$transaction(async (tx) => {
-    const created = await tx.product.create({
-      data: {
-        organizationId,
-        sku: input.sku,
-        name: input.name,
-        category: input.category ?? null,
-        brand: input.brand ?? null,
-        unit: input.unit ?? 'pcs',
-        unitCost: input.unitCost,
-        sellingPrice: input.sellingPrice,
-        status: input.status ?? 'ACTIVE',
-        leadTimeDays: input.leadTimeDays ?? 5,
-        reorderPoint: input.reorderPoint ?? 0,
-        safetyStock: input.safetyStock ?? 0,
-        moq: input.moq ?? 1,
-      },
+  const product = await withTransaction(async () => {
+    const created = await insertOne<ProductDoc>(cols.products, {
+      organizationId,
+      sku: input.sku,
+      name: input.name,
+      category: input.category ?? null,
+      brand: input.brand ?? null,
+      unit: input.unit ?? 'pcs',
+      unitCost: input.unitCost,
+      sellingPrice: input.sellingPrice,
+      status: input.status ?? 'ACTIVE',
+      leadTimeDays: input.leadTimeDays ?? 5,
+      reorderPoint: input.reorderPoint ?? 0,
+      safetyStock: input.safetyStock ?? 0,
+      moq: input.moq ?? 1,
     });
-
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.PRODUCT_CREATED,
@@ -107,63 +88,50 @@ export async function createProduct(organizationId: string, userId: string, inpu
       entityId: created.id,
       metadata: { sku: created.sku, name: created.name },
     });
-
     return created;
   });
-
   return toProduct(product);
 }
 
-export async function updateProduct(
-  organizationId: string,
-  userId: string,
-  id: string,
-  input: UpdateBody,
-) {
-  const existing = await prisma.product.findFirst({ where: { id, organizationId } });
+export async function updateProduct(organizationId: string, userId: string, id: string, input: UpdateBody) {
+  const existing = await findOne<ProductDoc>(cols.products, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Product not found');
   }
-
   if (input.sku && input.sku !== existing.sku) {
-    const duplicate = await prisma.product.findFirst({
-      where: { organizationId, sku: input.sku, NOT: { id } },
-      select: { id: true },
+    const duplicate = await findOne<ProductDoc>(cols.products, {
+      organizationId,
+      sku: input.sku,
+      _id: { $ne: id },
     });
     if (duplicate) {
       throw conflict('SKU_CONFLICT', 'SKU already exists in this organization');
     }
   }
 
-  const product = await prisma.$transaction(async (tx) => {
-    const updated = await tx.product.updateMany({
-      where: { id, organizationId },
-      data: {
-        ...(input.sku !== undefined ? { sku: input.sku } : {}),
-        ...(input.name !== undefined ? { name: input.name } : {}),
-        ...(input.category !== undefined ? { category: input.category } : {}),
-        ...(input.brand !== undefined ? { brand: input.brand } : {}),
-        ...(input.unit !== undefined ? { unit: input.unit } : {}),
-        ...(input.unitCost !== undefined ? { unitCost: input.unitCost } : {}),
-        ...(input.sellingPrice !== undefined ? { sellingPrice: input.sellingPrice } : {}),
-        ...(input.status !== undefined ? { status: input.status } : {}),
-        ...(input.leadTimeDays !== undefined ? { leadTimeDays: input.leadTimeDays } : {}),
-        ...(input.reorderPoint !== undefined ? { reorderPoint: input.reorderPoint } : {}),
-        ...(input.safetyStock !== undefined ? { safetyStock: input.safetyStock } : {}),
-        ...(input.moq !== undefined ? { moq: input.moq } : {}),
-      },
+  const product = await withTransaction(async () => {
+    const updated = await patchMany(cols.products, { _id: id, organizationId }, {
+      ...(input.sku !== undefined ? { sku: input.sku } : {}),
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.category !== undefined ? { category: input.category } : {}),
+      ...(input.brand !== undefined ? { brand: input.brand } : {}),
+      ...(input.unit !== undefined ? { unit: input.unit } : {}),
+      ...(input.unitCost !== undefined ? { unitCost: input.unitCost } : {}),
+      ...(input.sellingPrice !== undefined ? { sellingPrice: input.sellingPrice } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.leadTimeDays !== undefined ? { leadTimeDays: input.leadTimeDays } : {}),
+      ...(input.reorderPoint !== undefined ? { reorderPoint: input.reorderPoint } : {}),
+      ...(input.safetyStock !== undefined ? { safetyStock: input.safetyStock } : {}),
+      ...(input.moq !== undefined ? { moq: input.moq } : {}),
     });
-
-    if (updated.count === 0) {
+    if (updated === 0) {
       throw notFound('Product not found');
     }
-
-    const fresh = await tx.product.findFirst({ where: { id, organizationId } });
+    const fresh = await findOne<ProductDoc>(cols.products, { _id: id, organizationId });
     if (!fresh) {
       throw notFound('Product not found');
     }
-
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.PRODUCT_UPDATED,
@@ -171,37 +139,32 @@ export async function updateProduct(
       entityId: id,
       metadata: { sku: fresh.sku },
     });
-
     return fresh;
   });
-
   return toProduct(product);
 }
 
 export async function deleteProduct(organizationId: string, userId: string, id: string) {
-  const existing = await prisma.product.findFirst({ where: { id, organizationId } });
+  const existing = await findOne<ProductDoc>(cols.products, { _id: id, organizationId });
   if (!existing) {
     throw notFound('Product not found');
   }
-
   const [sales, poItems] = await Promise.all([
-    prisma.sale.count({ where: { organizationId, productId: id } }),
-    prisma.purchaseOrderItem.count({ where: { organizationId, productId: id } }),
+    countDocs(cols.sales, { organizationId, productId: id }),
+    countDocs(cols.purchaseOrders, { organizationId, 'items.productId': id }),
   ]);
-
   if (sales > 0 || poItems > 0) {
     throw conflict(
       'PRODUCT_IN_USE',
       'Cannot delete a product with sales or purchase order history. Deactivate it instead.',
     );
   }
-
-  await prisma.$transaction(async (tx) => {
-    const deleted = await tx.product.deleteMany({ where: { id, organizationId } });
-    if (deleted.count === 0) {
+  await withTransaction(async () => {
+    const deleted = await removeMany(cols.products, { _id: id, organizationId });
+    if (deleted === 0) {
       throw notFound('Product not found');
     }
-    await recordAudit(tx, {
+    await recordAudit({
       organizationId,
       userId,
       action: AuditAction.PRODUCT_DELETED,
@@ -210,6 +173,5 @@ export async function deleteProduct(organizationId: string, userId: string, id: 
       metadata: { sku: existing.sku },
     });
   });
-
   return { id, deleted: true as const };
 }

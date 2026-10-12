@@ -1,4 +1,4 @@
-import { RiskLevel } from '@prisma/client';
+import { RiskLevel } from '../../domain/enums';
 import {
   FORECAST_WEIGHTS,
   MOVING_AVERAGE_WINDOWS,

@@ -1,8 +1,9 @@
-import { UserRole } from '@prisma/client';
 import request, { type Agent } from 'supertest';
 import { app } from '../src/app';
+import { cols, insertOne } from '../src/db/mongo';
+import type { UserDoc } from '../src/domain/documents';
+import type { UserRole } from '../src/domain/enums';
 import { hashPassword } from '../src/lib/password';
-import { prisma } from '../src/lib/prisma';
 import { deleteTenant } from '../src/lib/tenant-cleanup';
 
 export type AuthSession = {
@@ -39,14 +40,12 @@ export async function registerOwner(label: string): Promise<AuthSession> {
 export async function loginAs(organizationId: string, role: UserRole): Promise<AuthSession> {
   const email = `${role.toLowerCase()}-${Math.random().toString(16).slice(2)}@test.invorra`;
   const password = 'Password123';
-  await prisma.user.create({
-    data: {
-      organizationId,
-      email,
-      name: role,
-      role,
-      passwordHash: await hashPassword(password),
-    },
+  await insertOne<UserDoc>(cols.users, {
+    organizationId,
+    email,
+    name: role,
+    role,
+    passwordHash: await hashPassword(password),
   });
 
   const agent = request.agent(app);

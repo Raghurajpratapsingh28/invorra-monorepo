@@ -1,6 +1,5 @@
-import { Prisma } from '@prisma/client';
 import { MOVING_AVERAGE_WINDOWS } from '../../config/business';
-import { prisma } from '../../lib/prisma';
+import { aggregate, cols } from '../../db/mongo';
 import { addUtcDays, startOfUtcDay } from '../../utils/dates';
 import { calendarDatesEnding } from './planner';
 
@@ -17,31 +16,41 @@ export async function loadDailyDemand(
 ) {
   const end = startOfUtcDay(new Date());
   const start = addUtcDays(end, -(MOVING_AVERAGE_WINDOWS.thirty - 1));
-  const productFilter = filters.productId
-    ? Prisma.sql`AND "productId" = ${filters.productId}`
-    : Prisma.empty;
-  const warehouseFilter = filters.warehouseId
-    ? Prisma.sql`AND "warehouseId" = ${filters.warehouseId}`
-    : Prisma.empty;
-
-  const rows = await prisma.$queryRaw<DailyRow[]>`
-    SELECT "productId",
-           "warehouseId",
-           to_char(("soldAt" AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day,
-           SUM("quantity")::int AS quantity
-    FROM "Sale"
-    WHERE "organizationId" = ${organizationId}
-      AND "soldAt" >= ${start}
-      ${productFilter}
-      ${warehouseFilter}
-    GROUP BY "productId", "warehouseId", day
-  `;
+  const rows = await aggregate<{ _id: { productId: string; warehouseId: string; day: string }; quantity: number }>(
+    cols.sales,
+    [
+      {
+        $match: {
+          organizationId,
+          soldAt: { $gte: start },
+          ...(filters.productId ? { productId: filters.productId } : {}),
+          ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+        },
+      },
+      {
+        $group: {
+          _id: {
+            productId: '$productId',
+            warehouseId: '$warehouseId',
+            day: { $dateToString: { format: '%Y-%m-%d', date: '$soldAt', timezone: 'UTC' } },
+          },
+          quantity: { $sum: '$quantity' },
+        },
+      },
+    ],
+  );
 
   const byPosition = new Map<string, Map<string, number>>();
   for (const row of rows) {
-    const key = `${row.productId}:${row.warehouseId}`;
+    const daily: DailyRow = {
+      productId: row._id.productId,
+      warehouseId: row._id.warehouseId,
+      day: row._id.day,
+      quantity: Number(row.quantity),
+    };
+    const key = `${daily.productId}:${daily.warehouseId}`;
     const days = byPosition.get(key) ?? new Map<string, number>();
-    days.set(String(row.day), Number(row.quantity));
+    days.set(daily.day, daily.quantity);
     byPosition.set(key, days);
   }
 

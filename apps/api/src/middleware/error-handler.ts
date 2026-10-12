@@ -1,5 +1,5 @@
-import { Prisma } from '@prisma/client';
 import type { NextFunction, Request, Response } from 'express';
+import { MongoServerError } from 'mongodb';
 import { ZodError } from 'zod';
 import { env } from '../config/env';
 import { logger } from '../lib/logger';
@@ -41,24 +41,10 @@ export function errorHandler(
     code = 'VALIDATION_ERROR';
     message = 'Request validation failed';
     details = formatZodError(error);
-  } else if (error instanceof Prisma.PrismaClientKnownRequestError) {
-    if (error.code === 'P2002') {
-      statusCode = 409;
-      code = 'CONFLICT';
-      message = 'A record with these unique fields already exists';
-    } else if (error.code === 'P2003') {
-      statusCode = 409;
-      code = 'CONFLICT';
-      message = 'This record is still referenced by related data';
-    } else if (error.code === 'P2025') {
-      statusCode = 404;
-      code = 'NOT_FOUND';
-      message = 'Record not found';
-    } else {
-      statusCode = 400;
-      code = 'DATABASE_ERROR';
-      message = 'The request could not be completed';
-    }
+  } else if (error instanceof MongoServerError && error.code === 11000) {
+    statusCode = 409;
+    code = 'CONFLICT';
+    message = 'A record with these unique fields already exists';
   } else if (error instanceof SyntaxError && 'body' in error) {
     statusCode = 400;
     code = 'INVALID_JSON';

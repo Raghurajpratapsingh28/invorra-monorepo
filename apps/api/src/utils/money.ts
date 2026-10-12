@@ -1,9 +1,9 @@
-import { Prisma } from '@prisma/client';
+import Decimal from 'decimal.js';
 
-export function decimalToString(value: Prisma.Decimal | number | string): string {
-  return new Prisma.Decimal(value).toFixed(2);
+export function decimalToString(value: Decimal | number | string): string {
+  return new Decimal(value).toFixed(2);
 }
 
-export function toDecimal(value: Prisma.Decimal | number | string): Prisma.Decimal {
-  return new Prisma.Decimal(value);
+export function toDecimal(value: Decimal | number | string): Decimal {
+  return new Decimal(value);
 }
